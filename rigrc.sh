@@ -8,7 +8,7 @@ set -eEuo pipefail
 shopt -s inherit_errexit 2>/dev/null || true
 
 _BUNDLE_WORKDIR=""
-_BUNDLE_EXPECTED_SHA="7d1c7f52228680cf7826713f4563a7c24dc62e5ee3d7d7ec56b69ac869718387"
+_BUNDLE_EXPECTED_SHA="df313d8784a91560d66f21ca403f045fa4f5f569f1a13a7c3ccbd7be3c311cb2"
 
 _init_bundle_assets() {
     # If running inside repo where packages/ and src/base.conf exist, use local files
@@ -71,7 +71,17 @@ if [[ -z "${SCRIPT_DIR:-}" ]]; then
     SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     if [[ "$SCRIPT_DIR" == */src/* || "$SCRIPT_DIR" == */src ]]; then
         SCRIPT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-        [[ "$SCRIPT_DIR" == */src ]] && SCRIPT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+    fi
+fi
+RIGRC_VERSION="${RIGRC_VERSION:-1a6a1ce}"
+if [[ -z "$RIGRC_VERSION" ]]; then
+    if command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        RIGRC_VERSION="$(git rev-parse --short HEAD 2>/dev/null || echo "dev")"
+        if [[ -n "$(git status --porcelain 2>/dev/null)" ]]; then
+            RIGRC_VERSION="${RIGRC_VERSION}-dirty"
+        fi
+    else
+        RIGRC_VERSION="dev"
     fi
 fi
 DOTFILES_DIR="${DOTFILES_DIR:-$HOME/.dotfiles}"
@@ -99,15 +109,12 @@ OFFLINE="${OFFLINE:-false}"
 INSTALL_TIMEOUT="${INSTALL_TIMEOUT:-300}"
 MAX_RETRIES="${MAX_RETRIES:-3}"
 RETRY_DELAY="${RETRY_DELAY:-2}"
-NETWORK_TIMEOUT="${NETWORK_TIMEOUT:-15}"
 BACKUP_COUNT=0
 SUDO_PID=""
 
 # Failure and warning registries
-declare -a _FAILED_PACKAGES=()
-declare -A _FAILURE_REASONS=()
-declare -a _WARNING_MESSAGES=()
-declare -A _DEP_RESOLVE_STACK=()
+declare -a _FAILED_PACKAGES=() _WARNING_MESSAGES=()
+declare -A _FAILURE_REASONS=() _DEP_RESOLVE_STACK=()
 _LAST_CMD_ERROR=""
 
 # System detection and lookup caches
@@ -142,29 +149,15 @@ declare -i _INSTALLED_PACKAGES_COUNT=0
 # In-memory package & group manifest cache
 declare -a _GROUPS_LIST=()
 declare -A _GROUP_DESCS=() _GROUP_PACKAGES_MAP=() _GROUP_OPTIONAL=()
-declare -i _GROUPS_LOADED=0
+declare -i _GROUPS_LOADED=0 _CONF_CASCADE_DONE=0
 
-declare -A _CONF_PARSED=()
-declare -A _CONF_PKG_NAME=()
-declare -A _CONF_PKG_BIN=()
-declare -A _CONF_PKG_DESC=()
-declare -A _CONF_PKG_SCOPE=()
-declare -A _CONF_PKG_INSTALL=()
-declare -A _CONF_PKG_OPTS=()
-declare -A _CONF_BASHRC=()
-declare -A _CONF_TEMPLATES=()
+declare -A _CONF_PARSED=() _CONF_PKG_NAME=() _CONF_PKG_BIN=() _CONF_PKG_DESC=() \
+           _CONF_PKG_SCOPE=() _CONF_PKG_INSTALL=() _CONF_PKG_OPTS=() _CONF_BASHRC=() _CONF_TEMPLATES=()
 
-declare -A _CONF_PKG_KEYS=()
-declare -A _CONF_PKG_DISABLED=()
-declare -A _CONF_PKG_DECLINED=()
-declare -A _CONF_BASHRC_BUF=()
-declare -A _CONF_BASHRC_DIS=()
-declare -A _CONF_TMPL_BUF=()
-declare -A _CONF_TMPL_DIS=()
+declare -A _CONF_PKG_KEYS=() _CONF_PKG_DISABLED=() _CONF_PKG_DECLINED=() \
+           _CONF_BASHRC_BUF=() _CONF_BASHRC_DIS=() _CONF_TMPL_BUF=() _CONF_TMPL_DIS=()
 
-declare -i _CONF_CASCADE_DONE=0
-declare -a _TRACKED_TMP_FILES=()
-declare -a _TRACKED_CHILD_PIDS=()
+declare -a _TRACKED_TMP_FILES=() _TRACKED_CHILD_PIDS=()
 
 # ---------------------------------------------------------------------------
 # Cleanup & signal traps
@@ -174,13 +167,10 @@ _cleanup() {
     [[ -t 2 ]] && printf '\033[?25h\033]0;\007' >&2 || true
     [[ -n "$SUDO_PID" ]] && kill "$SUDO_PID" 2>/dev/null || true
 
-    # Clean tracked background children
+    # Clean tracked background children in batch
     if [[ ${#_TRACKED_CHILD_PIDS[@]} -gt 0 ]]; then
-        local cpid
-        for cpid in "${_TRACKED_CHILD_PIDS[@]}"; do
-            kill -TERM "$cpid" 2>/dev/null || true
-            kill -KILL "$cpid" 2>/dev/null || true
-        done
+        kill -TERM "${_TRACKED_CHILD_PIDS[@]}" 2>/dev/null || true
+        kill -KILL "${_TRACKED_CHILD_PIDS[@]}" 2>/dev/null || true
         _TRACKED_CHILD_PIDS=()
     fi
 
@@ -193,10 +183,7 @@ _cleanup() {
         rm -rf "$_BUNDLE_WORKDIR"
     fi
     if [[ ${#_TRACKED_TMP_FILES[@]} -gt 0 ]]; then
-        local tf
-        for tf in "${_TRACKED_TMP_FILES[@]}"; do
-            [[ -f "$tf" ]] && rm -f "$tf"
-        done
+        rm -f "${_TRACKED_TMP_FILES[@]}" 2>/dev/null || true
         _TRACKED_TMP_FILES=()
     fi
     [[ "$code" -ne 0 ]] && log_error "Setup interrupted with exit code $code." || true
@@ -223,29 +210,11 @@ _acquire_sudo() {
     fi
     [[ -n "${SUDO_PID:-}" ]] && kill "$SUDO_PID" 2>/dev/null || true
 
-    if sudo -n true 2>/dev/null; then
-        (while true; do sudo -n true 2>/dev/null; sleep 60; kill -0 "$$" 2>/dev/null || exit; done) &
-        SUDO_PID=$!
-        return 0
+    if ! sudo -n true 2>/dev/null; then
+        log_info "Requesting sudo access for ${target_pm}."
+        sudo -v || { log_error "Sudo authentication failed."; exit 1; }
     fi
 
-    log_info "Requesting sudo access for ${target_pm}."
-    if [[ -t 0 || -t 1 || -c /dev/tty ]] && [[ "${NON_INTERACTIVE:-false}" == false ]]; then
-        local pass
-        pass="$(_ui_password "[sudo] password for ${USER:-root}")"
-        if [[ -n "$pass" ]]; then
-            if printf '%s\n' "$pass" | sudo -S -v 2>/dev/null; then
-                unset pass
-                (while true; do sudo -n true 2>/dev/null; sleep 60; kill -0 "$$" 2>/dev/null || exit; done) &
-                SUDO_PID=$!
-                return 0
-            fi
-            unset pass
-            log_warn "Sudo pipe authentication failed. Falling back to interactive prompt..."
-        fi
-    fi
-
-    sudo -v || { log_error "Sudo authentication failed."; exit 1; }
     (while true; do sudo -n true 2>/dev/null; sleep 60; kill -0 "$$" 2>/dev/null || exit; done) &
     SUDO_PID=$!
 }
@@ -310,52 +279,6 @@ _run_retry() {
         attempt=$(( attempt + 1 ))
     done
     return $rc
-}
-
-_curl_cmd() {
-    local -a args=(curl --proto '=https' --tlsv1.2 -fsSL --connect-timeout "${NETWORK_TIMEOUT:-15}" --max-time "${INSTALL_TIMEOUT:-120}")
-    local has_gh=false arg
-    for arg in "$@"; do
-        if [[ "$arg" == *"github.com"* || "$arg" == *"api.github.com"* ]]; then
-            has_gh=true
-            break
-        fi
-    done
-    if [[ "$has_gh" == true ]]; then
-        local token="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
-        if [[ -n "$token" ]]; then
-            args+=(-H "Authorization: Bearer $token")
-        fi
-    fi
-    "${args[@]}" "$@"
-}
-
-_fetch_github_release_version() {
-    local repo="$1"
-    local version=""
-    local token="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
-    local -a auth_hdr=()
-    [[ -n "$token" ]] && auth_hdr=(-H "Authorization: Bearer $token")
-
-    local api_url="https://api.github.com/repos/${repo}/releases/latest"
-    local json_out=""
-    json_out="$(curl --proto '=https' --tlsv1.2 -sSL --connect-timeout 5 --max-time 15 "${auth_hdr[@]}" -H "Accept: application/vnd.github+json" "$api_url" 2>/dev/null || true)"
-    if [[ -n "$json_out" && "$json_out" =~ \"tag_name\":[[:space:]]*\"([^\"]+)\" ]]; then
-        version="${BASH_REMATCH[1]}"
-    fi
-
-    if [[ -z "$version" || "$version" == "null" ]]; then
-        local red_url
-        red_url="$(curl --proto '=https' --tlsv1.2 -sSL -o /dev/null -w '%{url_effective}' --connect-timeout 5 --max-time 15 "https://github.com/${repo}/releases/latest" 2>/dev/null || true)"
-        if [[ -n "$red_url" && "$red_url" == *"/releases/tag/"* ]]; then
-            version="${red_url##*/}"
-        fi
-    fi
-
-    if [[ -z "$version" || "$version" == "latest" ]]; then
-        return 1
-    fi
-    printf '%s' "$version"
 }
 
 # ---------------------------------------------------------------------------
@@ -479,22 +402,12 @@ _get_detected_conds() {
     fi
 }
 
-_is_system_path() {
-    local path="$1"
-    [[ -z "$path" ]] && return 1
-    if [[ "$path" == "$HOME/"* || "$path" == "/home/"* ]]; then
-        return 1
-    fi
-    return 0
+_is_user_path() {
+    [[ -n "${1:-}" && ( "$1" == "$HOME/"* || "$1" == "/home/"* ) ]]
 }
 
-_is_user_path() {
-    local path="$1"
-    [[ -z "$path" ]] && return 1
-    if [[ "$path" == "$HOME/"* || "$path" == "/home/"* ]]; then
-        return 0
-    fi
-    return 1
+_is_system_path() {
+    [[ -n "${1:-}" ]] && ! _is_user_path "$1"
 }
 
 # Check if binary exists in scoped search paths
@@ -504,28 +417,31 @@ _check_bins_scoped() {
     local b _bins scope="${2:-any}"
     IFS=',' read -ra _bins <<< "$1"
     for b in "${_bins[@]}"; do
-        b="${b#"${b%%[![:space:]]*}"}"; b="${b%"${b##*[![:space:]]}"}"
+        b="$(_trim "$b")"
         [[ -z "$b" ]] && continue
 
         local -a candidates=()
+        local -A _seen=()
+        _add_cand() {
+            local c="$1"
+            if [[ -n "$c" && -z "${_seen["$c"]:-}" ]]; then
+                _seen["$c"]=1
+                candidates+=("$c")
+            fi
+        }
+
         if [[ "$b" == /* && ( -e "$b" || -r "$b" ) ]]; then
-            candidates+=("$b")
+            _add_cand "$b"
         fi
         local p
         while IFS= read -r p; do
-            [[ -n "$p" && -x "$p" ]] && candidates+=("$p")
+            [[ -n "$p" && -x "$p" ]] && _add_cand "$p"
         done < <(type -aP "$b" 2>/dev/null || true)
 
         if [[ "$scope" == "user" || "$scope" == "any" ]]; then
             local udir
             for udir in "${XDG_BIN_HOME:-$HOME/.local/bin}" "$HOME/.cargo/bin" "${XDG_DATA_HOME:-$HOME/.local/share}/mise/shims" "$HOME/.local/share/mise/shims" "$HOME/.bun/bin" "$HOME/go/bin" "$HOME/.atuin/bin" "$HOME/.gemini/antigravity-cli/bin" "$HOME/.opencode/bin" "$HOME/.codex/bin"; do
-                if [[ -x "$udir/$b" ]]; then
-                    local already_in=0 c
-                    for c in "${candidates[@]}"; do
-                        [[ "$c" == "$udir/$b" ]] && { already_in=1; break; }
-                    done
-                    [[ $already_in -eq 0 ]] && candidates+=("$udir/$b")
-                fi
+                [[ -x "$udir/$b" ]] && _add_cand "$udir/$b"
             done
 
             local mise_cmd=""
@@ -537,31 +453,19 @@ _check_bins_scoped() {
             if [[ -n "$mise_cmd" ]]; then
                 local mise_bin
                 mise_bin="$("$mise_cmd" which "$b" 2>/dev/null || true)"
-                if [[ -n "$mise_bin" && -x "$mise_bin" ]]; then
-                    local already_in=0 c
-                    for c in "${candidates[@]}"; do
-                        [[ "$c" == "$mise_bin" ]] && { already_in=1; break; }
-                    done
-                    [[ $already_in -eq 0 ]] && candidates+=("$mise_bin")
-                fi
+                [[ -n "$mise_bin" && -x "$mise_bin" ]] && _add_cand "$mise_bin"
             fi
 
             local s_root
             for s_root in "${SDKMAN_DIR:-}" "${XDG_DATA_HOME:-$HOME/.local/share}/sdkman" "$HOME/.sdkman"; do
                 [[ -z "$s_root" ]] && continue
                 if [[ ( "$b" == "sdk" || "$b" == "sdkman" ) && -s "$s_root/bin/sdkman-init.sh" ]]; then
-                    candidates+=("$s_root/bin/sdkman-init.sh")
+                    _add_cand "$s_root/bin/sdkman-init.sh"
                 fi
                 if [[ -d "$s_root/candidates" ]]; then
                     local s_cand
                     for s_cand in "$s_root/candidates"/*; do
-                        if [[ -x "$s_cand/current/bin/$b" ]]; then
-                            local already_in=0 c
-                            for c in "${candidates[@]}"; do
-                                [[ "$c" == "$s_cand/current/bin/$b" ]] && { already_in=1; break; }
-                            done
-                            [[ $already_in -eq 0 ]] && candidates+=("$s_cand/current/bin/$b")
-                        fi
+                        [[ -x "$s_cand/current/bin/$b" ]] && _add_cand "$s_cand/current/bin/$b"
                     done
                 fi
             done
@@ -570,13 +474,7 @@ _check_bins_scoped() {
         if [[ "$scope" == "system" || "$scope" == "any" ]]; then
             local sdir
             for sdir in "/usr/local/bin" "/usr/bin" "/bin" "/usr/sbin" "/sbin" "/opt/bin"; do
-                if [[ -x "$sdir/$b" ]]; then
-                    local already_in=0 c
-                    for c in "${candidates[@]}"; do
-                        [[ "$c" == "$sdir/$b" ]] && { already_in=1; break; }
-                    done
-                    [[ $already_in -eq 0 ]] && candidates+=("$sdir/$b")
-                fi
+                [[ -x "$sdir/$b" ]] && _add_cand "$sdir/$b"
             done
         fi
 
@@ -615,7 +513,7 @@ _check_bins_scoped() {
 }
 
 _check_bins() {
-    _check_bins_scoped "$1" "any"
+    _check_bins_scoped "$@"
 }
 
 # Quick non-blocking network probe
@@ -657,27 +555,45 @@ _check_disk_space() {
 # ---------------------------------------------------------------------------
 # Colors & Theme Foundation (Tier 0)
 # ---------------------------------------------------------------------------
-if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
-    RESET=$'\033[0m' BOLD=$'\033[1m' DIM=$'\033[2m' ITALIC=$'\033[3m'
-    CLR_PRIMARY=$'\033[38;5;39m'   # Sky Blue / Electric Cyan
-    CLR_ACCENT=$'\033[38;5;213m'   # Soft Magenta
-    CLR_SUCCESS=$'\033[38;5;82m'   # Bright Emerald Green
-    CLR_WARN=$'\033[38;5;214m'      # Warm Amber Yellow
-    CLR_ERROR=$'\033[38;5;196m'     # Vivid Crimson Red
-    CLR_MUTED=$'\033[38;5;244m'     # Medium Slate Gray
-    CLR_TEXT=$'\033[38;5;255m'      # High-contrast White
-    CLR_CARD=$'\033[48;5;236m'      # Dark background card
-    SYM_OK="✓" SYM_FAIL="✗" SYM_WARN="!" SYM_INFO="i" SYM_Q="?" SYM_DOT="●" SYM_CIRCLE="○" SYM_BLOCKED="⊘" SYM_ARROW="↳"
-else
-    RESET='' BOLD='' DIM='' ITALIC=''
-    CLR_PRIMARY='' CLR_ACCENT='' CLR_SUCCESS='' CLR_WARN='' CLR_ERROR='' CLR_MUTED='' CLR_TEXT='' CLR_CARD=''
-    SYM_OK="[OK]" SYM_FAIL="[ERR]" SYM_WARN="[!]" SYM_INFO="[i]" SYM_Q="[?]" SYM_DOT="*" SYM_CIRCLE="o" SYM_BLOCKED="[-]" SYM_ARROW="->"
-fi
+_ui_init_theme() {
+    local color_enabled=0
+    if [[ -n "${FORCE_COLOR:-}" && "${FORCE_COLOR}" != "0" ]] || [[ -n "${CLICOLOR_FORCE:-}" && "${CLICOLOR_FORCE}" != "0" ]]; then
+        color_enabled=1
+    elif [[ ( -t 1 || -t 2 ) && -z "${NO_COLOR:-}" && "${CLICOLOR:-1}" != "0" && "${TERM:-}" != "dumb" ]]; then
+        color_enabled=1
+    fi
 
-# Standardized indentation constants (2-space increments)
-INDENT_1="  "
-INDENT_2="    "
-INDENT_3="      "
+    if [[ "$color_enabled" -eq 1 && "${RIGRC_THEME:-}" != "mono" && "${RIGRC_THEME:-}" != "plain" && "${RIGRC_THEME:-}" != "none" ]]; then
+        RESET=$'\033[0m' BOLD=$'\033[1m' DIM=$'\033[2m' ITALIC=$'\033[3m'
+
+        case "${RIGRC_THEME:-default}" in
+            amber|orange|warm)
+                CLR_PRIMARY=$'\033[1;33m'   # Bold Amber
+                CLR_ACCENT=$'\033[36m'      # Cyan
+                ;;
+            cyan|blue)
+                CLR_PRIMARY=$'\033[1;36m'   # Bold Cyan
+                CLR_ACCENT=$'\033[33m'      # Amber
+                ;;
+            *) # default / native: Adaptive Unix Native (Bold Blue + Amber)
+                CLR_PRIMARY=$'\033[1;34m'   # Bold Blue
+                CLR_ACCENT=$'\033[33m'      # Amber / Yellow
+                ;;
+        esac
+
+        CLR_SUCCESS=$'\033[32m'         # Green
+        CLR_WARN=$'\033[33m'            # Yellow / Amber
+        CLR_ERROR=$'\033[1;31m'         # Bold Red
+        CLR_MUTED=$'\033[90m'           # Slate Gray / Bright Black
+        CLR_TEXT=''                     # Adaptive text (inherits terminal foreground)
+    else
+        RESET='' BOLD='' DIM='' ITALIC=''
+        CLR_PRIMARY='' CLR_ACCENT='' CLR_SUCCESS='' CLR_WARN='' CLR_ERROR='' CLR_MUTED='' CLR_TEXT=''
+    fi
+
+    SYM_OK="✓" SYM_FAIL="✗" SYM_WARN="!" SYM_INFO="i" SYM_Q="?" SYM_DOT="●" SYM_CIRCLE="○" SYM_BLOCKED="⊘" SYM_ARROW="↳" SYM_BULLET="•" SYM_DASH="–"
+}
+_ui_init_theme
 
 # ---------------------------------------------------------------------------
 # UI Logging Primitives
@@ -697,18 +613,12 @@ _ui_header() {
     fi
 }
 
+_LAST_BELL_TIME=-999
 _ui_bell() {
     [[ "${NON_INTERACTIVE:-false}" == true || "${DOTFILES_NO_BELL:-false}" == true ]] && return 0
-    local bell_file="${TMPDIR:-/tmp}/.dotfiles_bell_$$"
-    local now
-    now="$(date +%s 2>/dev/null || printf '%s' "${SECONDS:-0}")"
-    local last=0
-    if [[ -f "$bell_file" ]]; then
-        last="$(<"$bell_file")" 2>/dev/null || last=0
-    fi
     local min_interval=45
-    if [[ $(( now - last )) -ge $min_interval ]]; then
-        printf '%s' "$now" > "$bell_file" 2>/dev/null || true
+    if [[ $(( SECONDS - _LAST_BELL_TIME )) -ge $min_interval ]]; then
+        _LAST_BELL_TIME=$SECONDS
         if [[ -t 2 || -c /dev/tty ]]; then
             printf '\a' >&2
         fi
@@ -737,9 +647,9 @@ _ui_input() {
     if [[ -t 2 && -c /dev/tty ]]; then
         local display_res
         if [[ -z "$res" ]]; then
-            display_res="${CLR_MUTED}↳ skipped${RESET}"
+            display_res="${CLR_MUTED}${SYM_ARROW} skipped${RESET}"
         else
-            display_res="${CLR_TEXT}↳ ${res}${RESET}"
+            display_res="${CLR_TEXT}${SYM_ARROW} ${res}${RESET}"
         fi
         printf '\033[1A\033[2K%s%-16s %s\n' "$ind" "${prompt}" "$display_res" >&2
     fi
@@ -783,20 +693,29 @@ _ui_select() {
     if [[ -t 0 && -t 2 && -c /dev/tty ]]; then
         local selected=0
         local total=${#opts[@]}
+        local menu_height=$(( total + 1 ))
         local key=""
         printf '\033[?25l' >&2 # Hide cursor
 
         _render_menu() {
-            printf '  %s %s\n' "${CLR_PRIMARY}${SYM_Q}${RESET}" "${BOLD}${prompt}${RESET}" >&2
+            local out_buf=""
+            out_buf+=$'\r\033[2K'"  ${CLR_PRIMARY}${SYM_Q}${RESET} ${BOLD}${prompt}${RESET}"$'\n'
             local i
             for i in "${!opts[@]}"; do
                 if [[ $i -eq $selected ]]; then
-                    printf '    %s %s\n' "${CLR_PRIMARY}●${RESET}" "${BOLD}${CLR_PRIMARY}${opts[$i]}${RESET}" >&2
+                    out_buf+=$'\r\033[2K'"    ${CLR_PRIMARY}${SYM_DOT}${RESET} ${BOLD}${CLR_PRIMARY}${opts[$i]}${RESET}"$'\n'
                 else
-                    printf '    %s %s\n' "${CLR_MUTED}○${RESET}" "${CLR_MUTED}${opts[$i]}${RESET}" >&2
+                    out_buf+=$'\r\033[2K'"    ${CLR_MUTED}${SYM_CIRCLE}${RESET} ${CLR_MUTED}${opts[$i]}${RESET}"$'\n'
                 fi
             done
+            printf '%s' "$out_buf" >&2
         }
+
+        local _pre
+        for (( _pre=0; _pre < menu_height; _pre++ )); do
+            printf '\n' >&2
+        done
+        printf '\r\033[%dA' "$menu_height" >&2
 
         _render_menu
 
@@ -808,10 +727,10 @@ _ui_select() {
             fi
 
             case "$key" in
-                $'\x1b[A'|k|K)
+                $'\x1b[A'|$'\x1bOA'|k|K)
                     selected=$(( (selected - 1 + total) % total ))
                     ;;
-                $'\x1b[B'|j|J)
+                $'\x1b[B'|$'\x1bOB'|j|J)
                     selected=$(( (selected + 1) % total ))
                     ;;
                 "")
@@ -829,12 +748,12 @@ _ui_select() {
                     ;;
             esac
 
-            printf '\033[%dA' "$((total + 1))" >&2
+            printf '\r\033[%dA' "$menu_height" >&2
             _render_menu
         done
 
         printf '\033[?25h' >&2 # Restore cursor
-        printf '\033[%dA\033[J' "$((total + 1))" >&2
+        printf '\r\033[%dA\033[J' "$menu_height" >&2
         printf '  %s %s: %s\n' "${CLR_SUCCESS}${SYM_OK}${RESET}" "${prompt}" "${CLR_PRIMARY}${BOLD}${opts[$selected]}${RESET}" >&2
         printf '%s' "${opts[$selected]}"
         return 0
@@ -914,38 +833,52 @@ _ui_multiselect() {
 
     local max_name_len=0
     local max_tag_len=0
+    local -a _ms_raw_tags=() _ms_tag_fmts=()
     local _idx
     for _idx in "${!_ms_items[@]}"; do
-        local _item="${_ms_items[$_idx]}"
-        local _lbl="${_ms_labels[$_idx]:-$_item}"
-        local _lock="${_ms_locks[$_idx]:-}"
+        local _item="${_ms_items[_idx]}"
+        local _lbl="${_ms_labels[_idx]:-$_item}"
+        local _lock="${_ms_locks[_idx]:-}"
         [[ ${#_lbl} -gt $max_name_len ]] && max_name_len=${#_lbl}
 
-        local _rtag=""
-        if [[ "$_lock" == "required" ]]; then
-            _rtag="required"
-        elif [[ "$_lock" == "installed:"* || "$_lock" == "installed" ]]; then
-            _rtag="installed"
-        elif [[ "$_lock" == "alt:"*" installed" ]]; then
-            local _at="${_lock#alt:}"
-            _at="${_at% installed}"
-            _rtag="alternative to ${_at} (installed)"
+        local _rtag="" _tfmt=""
+        if [[ "$_lock" == "config" ]]; then
+            _rtag="selected in config"
+            _tfmt="${CLR_PRIMARY}${_rtag}${RESET}"
+        elif [[ "$_lock" == "required" ]]; then
+            _rtag="core system"
+            _tfmt="${CLR_ACCENT}${_rtag}${RESET}"
+        elif [[ "$_lock" == "installed"* ]]; then
+            _rtag="already installed"
+            _tfmt="${CLR_MUTED}${_rtag}${RESET}"
         elif [[ "$_lock" == "alt:"* ]]; then
             local _at="${_lock#alt:}"
+            _at="${_at% installed}"
             _rtag="alternative to ${_at}"
+            _tfmt="${CLR_MUTED}${_rtag}${RESET}"
         elif [[ "$_lock" == "unsupported:"* ]]; then
             local _r="${_lock#unsupported:}"
             local _env_label="$(_format_env_name "$_r")"
             _rtag="unavailable on ${_env_label}"
-        elif [[ "$_lock" == "disabled:missing "* ]]; then
-            local _r="${_lock#disabled:missing }"
-            _rtag="requires ${_r}"
+            _tfmt="${CLR_WARN}${_rtag}${RESET}"
         elif [[ "$_lock" == "disabled"* ]]; then
-            _rtag="disabled in config"
+            _rtag="disabled"
+            _tfmt="${CLR_MUTED}${_rtag}${RESET}"
         fi
+        _ms_raw_tags[$_idx]="$_rtag"
+        _ms_tag_fmts[$_idx]="$_tfmt"
         [[ ${#_rtag} -gt $max_tag_len ]] && max_tag_len=${#_rtag}
     done
     local name_col_width=$(( max_name_len + 2 ))
+
+    local term_lines=24
+    if command -v tput >/dev/null 2>&1; then
+        term_lines="$(tput lines 2>/dev/null || echo 24)"
+    fi
+    local max_visible=$(( term_lines - 6 ))
+    [[ $max_visible -lt 5 ]] && max_visible=5
+    [[ $max_visible -gt $total ]] && max_visible=$total
+    local menu_height=$(( max_visible + 3 ))
 
     _render_ms_menu() {
         local cols=80
@@ -953,6 +886,8 @@ _ui_multiselect() {
             cols="$(tput cols 2>/dev/null || echo 80)"
         fi
         local ind="${LOG_INDENT:-  }"
+        local max_line_width=$(( cols - 1 ))
+        [[ $max_line_width -lt 20 ]] && max_line_width=20
 
         local display_prompt="$prompt"
         if [[ "$prompt" =~ ^Packages[[:space:]]+in[[:space:]]+\[(.*)\]$ ]]; then
@@ -961,20 +896,50 @@ _ui_multiselect() {
             display_prompt="Select package groups"
         fi
 
-        printf '%s%s\n' "$ind" "${BOLD}${display_prompt}${RESET}" >&2
-        printf '%s%s\n\n' "$ind" "${CLR_MUTED}Space toggle · A all · Enter continue${RESET}" >&2
-
-        local avail_space=$(( cols - ${#ind} - 6 - name_col_width ))
-        local desc_col_width
-        if [[ $max_tag_len -gt 0 ]]; then
-            desc_col_width=$(( avail_space - max_tag_len - 2 ))
-        else
-            desc_col_width=$(( avail_space - 2 ))
+        local hint_text="Space toggle · A all · Enter continue"
+        if [[ $total -gt $max_visible ]]; then
+            hint_text="Space toggle · A all · Enter continue ($(( selected + 1 ))/${total})"
         fi
-        [[ $desc_col_width -lt 16 ]] && desc_col_width=16
+
+        local out_buf=""
+        out_buf+=$'\r\033[2K'"${ind}${BOLD}${display_prompt}${RESET}"$'\n'
+        out_buf+=$'\r\033[2K'"${ind}${CLR_MUTED}${hint_text}${RESET}"$'\n\r\033[2K\n'
+
+        local eff_name_width=$name_col_width
+        local max_allowed_name=$(( max_line_width / 3 ))
+        [[ $max_allowed_name -lt 12 ]] && max_allowed_name=12
+        [[ $eff_name_width -gt $max_allowed_name ]] && eff_name_width=$max_allowed_name
+
+        local prefix_len=$(( ${#ind} + 5 + eff_name_width ))
+        local avail_space=$(( max_line_width - prefix_len ))
+
+        local desc_col_width=0
+        if [[ $max_tag_len -gt 0 ]]; then
+            if [[ $avail_space -ge $(( max_tag_len + 10 )) ]]; then
+                desc_col_width=$(( avail_space - max_tag_len - 2 ))
+            else
+                desc_col_width=0
+            fi
+        else
+            desc_col_width=$(( avail_space > 0 ? avail_space : 0 ))
+        fi
+
+        local win_start=0
+        local win_end=$total
+        if [[ $total -gt $max_visible ]]; then
+            local half=$(( max_visible / 2 ))
+            win_start=$(( selected - half ))
+            [[ $win_start -lt 0 ]] && win_start=0
+            win_end=$(( win_start + max_visible ))
+            if [[ $win_end -gt $total ]]; then
+                win_end=$total
+                win_start=$(( total - max_visible ))
+                [[ $win_start -lt 0 ]] && win_start=0
+            fi
+        fi
 
         local i
-        for i in "${!_ms_items[@]}"; do
+        for (( i = win_start; i < win_end; i++ )); do
             local item="${_ms_items[$i]}"
             local lbl="${_ms_labels[$i]:-$item}"
             local desc="${_ms_descs[$i]:-}"
@@ -987,6 +952,8 @@ _ui_multiselect() {
             elif [[ "$lock" == "installed:"* || "$lock" == "installed" ]]; then
                 radio_icon="${CLR_SUCCESS}${SYM_OK}${RESET}"
             elif [[ "$lock" == "required" ]]; then
+                radio_icon="${CLR_ACCENT}${SYM_DOT}${RESET}"
+            elif [[ "$lock" == "config" ]]; then
                 radio_icon="${CLR_PRIMARY}${SYM_DOT}${RESET}"
             elif [[ "$st" -eq 1 ]]; then
                 radio_icon="${CLR_PRIMARY}${SYM_DOT}${RESET}"
@@ -994,79 +961,89 @@ _ui_multiselect() {
                 radio_icon="${CLR_MUTED}${SYM_CIRCLE}${RESET}"
             fi
 
-            local raw_tag="" tag_fmt=""
-            if [[ "$lock" == "required" ]]; then
-                raw_tag="required"
-                tag_fmt="${CLR_ACCENT}${raw_tag}${RESET}"
-            elif [[ "$lock" == "installed:"* || "$lock" == "installed" ]]; then
-                raw_tag="installed"
-                tag_fmt="${CLR_MUTED}${raw_tag}${RESET}"
-            elif [[ "$lock" == "alt:"*" installed" ]]; then
-                local alt_target="${lock#alt:}"
-                alt_target="${alt_target% installed}"
-                raw_tag="alternative to ${alt_target} (installed)"
-                tag_fmt="${CLR_MUTED}${raw_tag}${RESET}"
-            elif [[ "$lock" == "alt:"* ]]; then
-                local alt_target="${lock#alt:}"
-                raw_tag="alternative to ${alt_target}"
-                tag_fmt="${CLR_MUTED}${raw_tag}${RESET}"
-            elif [[ "$lock" == "unsupported:"* ]]; then
-                local reason="${lock#unsupported:}"
-                local env_label="$(_format_env_name "$reason")"
-                raw_tag="unavailable on ${env_label}"
-                tag_fmt="${CLR_WARN}${raw_tag}${RESET}"
-            elif [[ "$lock" == "disabled:missing "* ]]; then
-                local req_dep="${lock#disabled:missing }"
-                raw_tag="requires ${req_dep}"
-                tag_fmt="${CLR_MUTED}${raw_tag}${RESET}"
-            elif [[ "$lock" == "disabled"* ]]; then
-                raw_tag="disabled in config"
-                tag_fmt="${CLR_MUTED}${raw_tag}${RESET}"
-            fi
+            local raw_tag="${_ms_raw_tags[$i]:-}" tag_fmt="${_ms_tag_fmts[$i]:-}"
 
-            local pad_len=$(( name_col_width - ${#lbl} ))
+            local cur_lbl="$lbl"
+            if [[ ${#cur_lbl} -gt $eff_name_width ]]; then
+                cur_lbl="${cur_lbl:0:$((eff_name_width - 1))}…"
+            fi
+            local pad_len=$(( eff_name_width - ${#cur_lbl} ))
             [[ $pad_len -lt 1 ]] && pad_len=1
             local pad_spaces
             printf -v pad_spaces '%*s' "$pad_len" ""
 
             local cur_desc="$desc"
-            if [[ -n "$cur_desc" ]]; then
+            local desc_fmt=""
+            local desc_spaces=""
+            if [[ $desc_col_width -gt 0 && -n "$cur_desc" ]]; then
                 if [[ ${#cur_desc} -gt $desc_col_width ]]; then
                     cur_desc="${cur_desc:0:$((desc_col_width - 1))}…"
                 fi
-            fi
-
-            local desc_spaces=""
-            if [[ $max_tag_len -gt 0 ]]; then
                 local desc_pad=$(( desc_col_width - ${#cur_desc} ))
                 [[ $desc_pad -lt 1 ]] && desc_pad=1
                 printf -v desc_spaces '%*s' "$desc_pad" ""
+                if [[ $i -eq $selected && "$lock" != "disabled"* && "$lock" != "unsupported:"* ]]; then
+                    desc_fmt="${CLR_TEXT}${cur_desc}${RESET}"
+                else
+                    desc_fmt="${CLR_MUTED}${cur_desc}${RESET}"
+                fi
             fi
 
+            local cur_tag="$raw_tag"
+            local cur_tag_fmt="$tag_fmt"
+            if [[ -n "$cur_tag" ]]; then
+                local used_len=$(( ${#ind} + 5 + ${#cur_lbl} + pad_len + ${#cur_desc} + ${#desc_spaces} ))
+                local tag_space=$(( max_line_width - used_len ))
+                if [[ $tag_space -gt 0 && ${#cur_tag} -gt $tag_space ]]; then
+                    cur_tag="${cur_tag:0:$((tag_space - 1))}…"
+                    if [[ "$lock" == "required" ]]; then
+                        cur_tag_fmt="${CLR_ACCENT}${cur_tag}${RESET}"
+                    elif [[ "$lock" == "unsupported:"* ]]; then
+                        cur_tag_fmt="${CLR_WARN}${cur_tag}${RESET}"
+                    else
+                        cur_tag_fmt="${CLR_MUTED}${cur_tag}${RESET}"
+                    fi
+                elif [[ $tag_space -le 0 ]]; then
+                    cur_tag_fmt=""
+                fi
+            fi
+
+            local lbl_color
             if [[ $i -eq $selected ]]; then
                 if [[ "$lock" == "disabled"* || "$lock" == "unsupported:"* ]]; then
-                    local desc_fmt=""
-                    [[ -n "$cur_desc" ]] && desc_fmt="${CLR_MUTED}${cur_desc}${RESET}"
-                    printf '%s  %s  %s%s%s%s%s\n' "$ind" "$radio_icon" "${BOLD}${CLR_MUTED}${lbl}${RESET}" "$pad_spaces" "$desc_fmt" "$desc_spaces" "$tag_fmt" >&2
+                    lbl_color="${BOLD}${CLR_MUTED}"
                 else
-                    local desc_fmt=""
-                    [[ -n "$cur_desc" ]] && desc_fmt="${CLR_TEXT}${cur_desc}${RESET}"
-                    printf '%s  %s  %s%s%s%s%s\n' "$ind" "$radio_icon" "${BOLD}${CLR_PRIMARY}${lbl}${RESET}" "$pad_spaces" "$desc_fmt" "$desc_spaces" "$tag_fmt" >&2
+                    lbl_color="${BOLD}${CLR_PRIMARY}"
                 fi
             else
-                local desc_fmt=""
-                [[ -n "$cur_desc" ]] && desc_fmt="${CLR_MUTED}${cur_desc}${RESET}"
-                printf '%s  %s  %s%s%s%s%s\n' "$ind" "$radio_icon" "${CLR_MUTED}${lbl}${RESET}" "$pad_spaces" "$desc_fmt" "$desc_spaces" "$tag_fmt" >&2
+                lbl_color="${CLR_MUTED}"
             fi
+
+            out_buf+=$'\r\033[2K'"${ind}  ${radio_icon}  ${lbl_color}${cur_lbl}${RESET}${pad_spaces}${desc_fmt}${desc_spaces}${cur_tag_fmt}"$'\n'
         done
+
+        printf '%s' "$out_buf" >&2
     }
 
     # WINCH signal trap for window resizing
     _on_winch() {
-        printf '\033[%dA\033[J' "$((total + 3))" >&2
+        if command -v tput >/dev/null 2>&1; then
+            term_lines="$(tput lines 2>/dev/null || echo 24)"
+        fi
+        max_visible=$(( term_lines - 6 ))
+        [[ $max_visible -lt 5 ]] && max_visible=5
+        [[ $max_visible -gt $total ]] && max_visible=$total
+        menu_height=$(( max_visible + 3 ))
+        printf '\r\033[%dA\033[J' "$menu_height" >&2
         _render_ms_menu
     }
     trap '_on_winch' WINCH
+
+    local _pre
+    for (( _pre=0; _pre < menu_height; _pre++ )); do
+        printf '\n' >&2
+    done
+    printf '\r\033[%dA' "$menu_height" >&2
 
     _render_ms_menu
 
@@ -1075,18 +1052,35 @@ _ui_multiselect() {
         if [[ "$key" == $'\x1b' ]]; then
             read -rsn2 -t 0.1 rest < /dev/tty 2>/dev/null || rest=""
             key+="$rest"
+            while read -rsn1 -t 0.01 extra < /dev/tty 2>/dev/null; do
+                key+="$extra"
+            done
         fi
 
         case "$key" in
-            $'\x1b[A'|k|K)
+            $'\x1b[A'|$'\x1bOA'|k|K)
                 selected=$(( (selected - 1 + total) % total ))
                 ;;
-            $'\x1b[B'|j|J)
+            $'\x1b[B'|$'\x1bOB'|j|J)
                 selected=$(( (selected + 1) % total ))
+                ;;
+            $'\x1b[5~') # Page Up
+                selected=$(( selected - max_visible ))
+                [[ $selected -lt 0 ]] && selected=0
+                ;;
+            $'\x1b[6~') # Page Down
+                selected=$(( selected + max_visible ))
+                [[ $selected -ge $total ]] && selected=$(( total - 1 ))
+                ;;
+            $'\x1b[H'|$'\x1b[1~') # Home
+                selected=0
+                ;;
+            $'\x1b[F'|$'\x1b[4~') # End
+                selected=$(( total - 1 ))
                 ;;
             " "|x|X)
                 local cur_lock="${_ms_locks[$selected]:-}"
-                if [[ "$cur_lock" != "required" && "$cur_lock" != "installed:"* && "$cur_lock" != "unsupported:"* && "$cur_lock" != "disabled"* ]]; then
+                if [[ "$cur_lock" != "required" && "$cur_lock" != "config" && "$cur_lock" != "installed:"* && "$cur_lock" != "unsupported:"* && "$cur_lock" != "disabled"* ]]; then
                     if [[ "${_ms_states[$selected]:-0}" -eq 1 ]]; then
                         _ms_states[$selected]=0
                     else
@@ -1099,7 +1093,7 @@ _ui_multiselect() {
                 local j
                 for j in "${!_ms_items[@]}"; do
                     local j_lock="${_ms_locks[$j]:-}"
-                    if [[ "$j_lock" != "required" && "$j_lock" != "installed:"* && "$j_lock" != "unsupported:"* && "$j_lock" != "disabled"* ]]; then
+                    if [[ "$j_lock" != "required" && "$j_lock" != "config" && "$j_lock" != "installed:"* && "$j_lock" != "unsupported:"* && "$j_lock" != "disabled"* ]]; then
                         if [[ "${_ms_states[$j]:-0}" -ne 1 ]]; then
                             all_toggleable_checked=0
                             break
@@ -1108,7 +1102,7 @@ _ui_multiselect() {
                 done
                 for j in "${!_ms_items[@]}"; do
                     local j_lock="${_ms_locks[$j]:-}"
-                    if [[ "$j_lock" != "required" && "$j_lock" != "installed:"* && "$j_lock" != "unsupported:"* && "$j_lock" != "disabled"* ]]; then
+                    if [[ "$j_lock" != "required" && "$j_lock" != "config" && "$j_lock" != "installed:"* && "$j_lock" != "unsupported:"* && "$j_lock" != "disabled"* ]]; then
                         if [[ $all_toggleable_checked -eq 1 ]]; then
                             _ms_states[$j]=0
                         else
@@ -1122,14 +1116,14 @@ _ui_multiselect() {
                 ;;
         esac
 
-        printf '\033[%dA' "$((total + 3))" >&2
+        printf '\r\033[%dA' "$menu_height" >&2
         _render_ms_menu
     done
 
     trap - WINCH
 
     printf '\033[?25h' >&2
-    printf '\033[%dA\033[J' "$((total + 3))" >&2
+    printf '\r\033[%dA\033[J' "$menu_height" >&2
 
     local chosen_ids=()
     local chosen_lbls=()
@@ -1160,7 +1154,7 @@ _set_term_title() {
 }
 
 _ui_phase() {
-    local num="$1" total="$2" title="$3"
+    local title="${3:-$1}"
     _set_term_title "Dotfiles: ${title}"
     if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
         printf '\n%s\n' "${CLR_TEXT}${BOLD}${title}${RESET}" >&2
@@ -1170,26 +1164,26 @@ _ui_phase() {
 }
 
 _get_remediation_hint() {
-    local err_text="$1"
-    if [[ "$err_text" == *"lock"* || "$err_text" == *"Could not get lock"* ]]; then
-        printf 'Package manager lock busy. Wait for background update or clear stale lock.'
-    elif [[ "$err_text" == *"404"* || "$err_text" == *"Not Found"* ]]; then
-        printf 'Asset not found on release server. Check release URL and target architecture.'
-    elif [[ "$err_text" == *"403"* || "$err_text" == *"rate limit"* || "$err_text" == *"Rate limit"* ]]; then
-        printf 'GitHub API rate limit exceeded. Set GITHUB_TOKEN to proceed.'
-    elif [[ "$err_text" == *"Permission denied"* || "$err_text" == *"permission denied"* ]]; then
-        printf 'Permission denied. Run with sudo or fix target path permissions.'
-    elif [[ "$err_text" == *"checksum mismatch"* || "$err_text" == *"Checksum mismatch"* ]]; then
-        printf 'Checksum mismatch. Downloaded archive is corrupted or modified.'
-    elif [[ "$err_text" == *"No space left"* || "$err_text" == *"no space left"* ]]; then
-        printf 'Disk space exhausted. Free up disk space on target filesystem.'
-    elif [[ "$err_text" == *"timed out"* || "$err_text" == *"Timed out"* || "$err_text" == *"Operation timed out"* ]]; then
-        printf 'Operation timed out. Check network connection or increase INSTALL_TIMEOUT.'
-    elif [[ "$err_text" == *"SSL"* || "$err_text" == *"certificate"* || "$err_text" == *"TLS"* ]]; then
-        printf 'SSL/TLS certificate error. Verify system time and CA certificates.'
-    elif [[ "$err_text" == *"Connection refused"* || "$err_text" == *"Couldn't connect to server"* ]]; then
-        printf 'Connection refused. Check internet connectivity and proxy settings.'
-    fi
+    case "${1,,}" in
+        *lock*|*"could not get lock"*)
+            printf 'Package manager lock busy. Wait for background update or clear stale lock.' ;;
+        *404*|*"not found"*)
+            printf 'Asset not found on release server. Check release URL and target architecture.' ;;
+        *403*|*"rate limit"*)
+            printf 'GitHub API rate limit exceeded. Set GITHUB_TOKEN to proceed.' ;;
+        *"permission denied"*)
+            printf 'Permission denied. Run with sudo or fix target path permissions.' ;;
+        *"checksum mismatch"*)
+            printf 'Checksum mismatch. Downloaded archive is corrupted or modified.' ;;
+        *"no space left"*)
+            printf 'Disk space exhausted. Free up disk space on target filesystem.' ;;
+        *"timed out"*)
+            printf 'Operation timed out. Check network connection or increase INSTALL_TIMEOUT.' ;;
+        *ssl*|*certificate*|*tls*)
+            printf 'SSL/TLS certificate error. Verify system time and CA certificates.' ;;
+        *"connection refused"*|*"couldn't connect to server"*)
+            printf 'Connection refused. Check internet connectivity and proxy settings.' ;;
+    esac
 }
 
 _extract_last_error() {
@@ -1324,7 +1318,7 @@ _run_with_spinner() {
         printf '\r\033[2K%s%s %s %s\n' "$ind" "${CLR_ERROR}${BOLD}${SYM_FAIL}${RESET}" "${CLR_ERROR}${display_base} (failed)${RESET}" "${final_meta}" >&2
         _LAST_CMD_ERROR="$(_extract_last_error "$cmd_log")"
         if [[ -n "$_LAST_CMD_ERROR" ]]; then
-            printf '%s  %s %s\n' "$ind" "${CLR_ERROR}↳${RESET}" "${CLR_MUTED}${_LAST_CMD_ERROR}${RESET}" >&2
+            printf '%s  %s %s\n' "$ind" "${CLR_ERROR}${SYM_ARROW}${RESET}" "${CLR_MUTED}${_LAST_CMD_ERROR}${RESET}" >&2
             local rhint
             rhint="$(_get_remediation_hint "$_LAST_CMD_ERROR")"
             [[ -n "$rhint" ]] && printf '%s    %s %s\n' "$ind" "${CLR_WARN}hint:${RESET}" "${CLR_MUTED}${rhint}${RESET}" >&2
@@ -1378,7 +1372,7 @@ _ui_render_summary() {
         printf '%s\n' "${BOLD}${CLR_WARN}Warnings${RESET}" >&2
         local w
         for w in "${_WARNING_MESSAGES[@]}"; do
-            printf '  %s %s\n' "${CLR_WARN}!${RESET}" "$w" >&2
+            printf '  %s %s\n' "${CLR_WARN}${SYM_WARN}${RESET}" "$w" >&2
         done
     fi
 
@@ -1388,8 +1382,8 @@ _ui_render_summary() {
         local fp
         for fp in "${_FAILED_PACKAGES[@]}"; do
             local r="${_FAILURE_REASONS["$fp"]:-unknown error}"
-            printf '  %s %s\n' "${CLR_ERROR}✗${RESET}" "${BOLD}${fp}${RESET}" >&2
-            printf '    %s %s\n' "${CLR_ERROR}↳${RESET}" "${CLR_MUTED}${r}${RESET}" >&2
+            printf '  %s %s\n' "${CLR_ERROR}${BOLD}${SYM_FAIL}${RESET}" "${BOLD}${fp}${RESET}" >&2
+            printf '    %s %s\n' "${CLR_ERROR}${SYM_ARROW}${RESET}" "${CLR_MUTED}${r}${RESET}" >&2
             local rhint
             rhint="$(_get_remediation_hint "$r")"
             [[ -n "$rhint" ]] && printf '      %s %s\n' "${CLR_WARN}hint:${RESET}" "${CLR_MUTED}${rhint}${RESET}" >&2
@@ -1404,19 +1398,7 @@ _ui_render_summary() {
 # =============================================================================
 
 _in_cond_list() {
-    local target="$1" list_str="$2"
-    [[ -z "$list_str" ]] && return 1
-    local item ret=1 old_f="$-"
-    set -f
-    for item in ${list_str//,/ }; do
-        item="${item#"${item%%[![:space:]]*}"}"; item="${item%"${item##*[![:space:]]}"}"
-        if [[ "$item" == "$target" ]]; then
-            ret=0
-            break
-        fi
-    done
-    [[ "$old_f" != *f* ]] && set +f
-    return "$ret"
+    [[ -n "$2" && ",${2//[[:space:]]/}," == *",$1,"* ]]
 }
 
 _check_cond_match() {
@@ -1426,6 +1408,8 @@ _check_cond_match() {
     clean_target="${clean_target#env:}"
     _in_cond_list "$target" "$list_str" || _in_cond_list "$clean_target" "$list_str"
 }
+
+_UNMET_COND=""
 
 # Evaluate cond field or cond: option. Returns 0 = proceed, 1 = skip.
 _eval_cond() {
@@ -1437,14 +1421,14 @@ _eval_cond() {
         _preload_all_manifests "$PACKAGES_DIR"
     fi
 
-    local cond_override="${_CONF_PKG_KEYS["global:COND"]:-${COND:-}}"
-    local dis_cond_override="${_CONF_PKG_KEYS["global:DISABLE_COND"]:-${DISABLE_COND:-}}"
+    local cond_override="${_CONF_PKG_KEYS["global:cond"]:-${_CONF_PKG_KEYS["global:COND"]:-${COND:-}}}"
+    local dis_cond_override="${_CONF_PKG_KEYS["global:disable_cond"]:-${_CONF_PKG_KEYS["global:DISABLE_COND"]:-${DISABLE_COND:-}}}"
 
     local c sys_arch _conds not_c
     sys_arch="$(_get_arch)"
     IFS=',' read -ra _conds <<< "$cond"
     for c in "${_conds[@]}"; do
-        c="${c#"${c%%[![:space:]]*}"}"; c="${c%"${c##*[![:space:]]}"}"
+        c="$(_trim "$c")"
         [[ -z "$c" ]] && continue
 
         if [[ "$c" == *"!"* ]]; then
@@ -1460,6 +1444,7 @@ _eval_cond() {
         fi
 
         if _check_cond_match "$c" "$dis_cond_override" || _check_cond_match "$not_c" "$cond_override"; then
+            _UNMET_COND="$c"
             return 1
         fi
 
@@ -1471,24 +1456,31 @@ _eval_cond() {
         bare_c="${bare_c#env:}"
         bare_c="${bare_c/env:/}"
 
+        local passed=0
         case "$bare_c" in
-            desktop)                              [[ "$(_get_env)" == "desktop" ]] || return 1 ;;
-            '!desktop')                           [[ "$(_get_env)" != "desktop" ]] || return 1 ;;
-            linux)                                [[ "$(uname -s)" == Linux ]] || return 1 ;;
-            '!linux')                             [[ "$(uname -s)" != Linux ]] || return 1 ;;
-            wsl)                                  _is_wsl || return 1 ;;
-            '!wsl')                               _is_wsl && return 1 ;;
-            vps)                                  [[ "$(_get_env)" == "vps" ]] || return 1 ;;
-            '!vps')                               [[ "$(_get_env)" != "vps" ]] || return 1 ;;
-            container)                            _is_container || return 1 ;;
-            '!container')                         _is_container && return 1 ;;
-            arch:x86_64|x86_64|arch:amd64|amd64)     [[ "$sys_arch" == x86_64 ]] || return 1 ;;
-            arch:!x86_64|!x86_64|arch:!amd64|!amd64) [[ "$sys_arch" != x86_64 ]] || return 1 ;;
-            arch:arm64|arm64|arch:aarch64|aarch64)   [[ "$sys_arch" == arm64 ]] || return 1 ;;
-            arch:!arm64|!arm64|arch:!aarch64|!aarch64) [[ "$sys_arch" != arm64 ]] || return 1 ;;
-            *)                                    log_warn "Unknown condition '$c'. Skipping package."; return 1 ;;
+            desktop)                              [[ "$(_get_env)" == "desktop" ]] && passed=1 ;;
+            '!desktop')                           [[ "$(_get_env)" != "desktop" ]] && passed=1 ;;
+            linux)                                [[ "$(uname -s)" == Linux ]] && passed=1 ;;
+            '!linux')                             [[ "$(uname -s)" != Linux ]] && passed=1 ;;
+            wsl)                                  _is_wsl && passed=1 ;;
+            '!wsl')                               ! _is_wsl && passed=1 ;;
+            vps)                                  [[ "$(_get_env)" == "vps" ]] && passed=1 ;;
+            '!vps')                               [[ "$(_get_env)" != "vps" ]] && passed=1 ;;
+            container)                            _is_container && passed=1 ;;
+            '!container')                         ! _is_container && passed=1 ;;
+            arch:x86_64|x86_64|arch:amd64|amd64)     [[ "$sys_arch" == x86_64 ]] && passed=1 ;;
+            arch:!x86_64|!x86_64|arch:!amd64|!amd64) [[ "$sys_arch" != x86_64 ]] && passed=1 ;;
+            arch:arm64|arm64|arch:aarch64|aarch64)   [[ "$sys_arch" == arm64 ]] && passed=1 ;;
+            arch:!arm64|!arm64|arch:!aarch64|!aarch64) [[ "$sys_arch" != arm64 ]] && passed=1 ;;
+            *)                                    log_warn "Unknown condition '$c'. Skipping package." ;;
         esac
+
+        if [[ $passed -eq 0 ]]; then
+            _UNMET_COND="$c"
+            return 1
+        fi
     done
+    _UNMET_COND=""
     return 0
 }
 
@@ -1496,135 +1488,14 @@ _eval_cond() {
 _get_failed_cond_reason() {
     local cond="$1" opts="${2:-}"
     [[ -z "$cond" ]] && cond="$(_get_opt cond "$opts")"
-    [[ -z "$cond" ]] && { printf 'unmet'; return 0; }
-
-    local cond_override="${_CONF_PKG_KEYS["global:COND"]:-${COND:-}}"
-    local dis_cond_override="${_CONF_PKG_KEYS["global:DISABLE_COND"]:-${DISABLE_COND:-}}"
-    local sys_arch="$(_get_arch)"
-
-    local c _conds not_c
-    IFS=',' read -ra _conds <<< "$cond"
-    for c in "${_conds[@]}"; do
-        c="${c#"${c%%[![:space:]]*}"}"; c="${c%"${c##*[![:space:]]}"}"
-        [[ -z "$c" ]] && continue
-
-        if [[ "$c" == *"!"* ]]; then
-            not_c="${c//!/}"
-        else
-            if [[ "$c" == "arch:"* ]]; then
-                not_c="arch:!${c#arch:}"
-            elif [[ "$c" == "env:"* ]]; then
-                not_c="env:!${c#env:}"
-            else
-                not_c="!$c"
-            fi
-        fi
-
-        if _check_cond_match "$c" "$dis_cond_override" || _check_cond_match "$not_c" "$cond_override"; then
-            printf '%s' "${c}"
-            return 0
-        fi
-
-        if _check_cond_match "$c" "$cond_override"; then
-            continue
-        fi
-
-        local bare_c="$c"
-        bare_c="${bare_c#env:}"
-        bare_c="${bare_c/env:/}"
-
-        case "$bare_c" in
-            desktop)
-                if [[ "$(_get_env)" != "desktop" ]]; then
-                    printf '%s' "$(_get_env)"
-                    return 0
-                fi
-                ;;
-            '!desktop')
-                if [[ "$(_get_env)" == "desktop" ]]; then
-                    printf 'desktop'
-                    return 0
-                fi
-                ;;
-            linux)
-                if [[ "$(uname -s)" != Linux ]]; then
-                    printf '%s' "$(uname -s)"
-                    return 0
-                fi
-                ;;
-            '!linux')
-                if [[ "$(uname -s)" == Linux ]]; then
-                    printf 'linux'
-                    return 0
-                fi
-                ;;
-            wsl)
-                if ! _is_wsl; then
-                    printf 'non-wsl'
-                    return 0
-                fi
-                ;;
-            '!wsl')
-                if _is_wsl; then
-                    printf 'wsl'
-                    return 0
-                fi
-                ;;
-            vps)
-                if [[ "$(_get_env)" != "vps" ]]; then
-                    printf '%s' "$(_get_env)"
-                    return 0
-                fi
-                ;;
-            '!vps')
-                if [[ "$(_get_env)" == "vps" ]]; then
-                    printf 'vps'
-                    return 0
-                fi
-                ;;
-            container)
-                if ! _is_container; then
-                    printf 'host'
-                    return 0
-                fi
-                ;;
-            '!container')
-                if _is_container; then
-                    printf 'container'
-                    return 0
-                fi
-                ;;
-            arch:x86_64|x86_64|arch:amd64|amd64)
-                if [[ "$sys_arch" != x86_64 ]]; then
-                    printf '%s' "$sys_arch"
-                    return 0
-                fi
-                ;;
-            arch:!x86_64|!x86_64|arch:!amd64|!amd64)
-                if [[ "$sys_arch" == x86_64 ]]; then
-                    printf '%s' "$sys_arch"
-                    return 0
-                fi
-                ;;
-            arch:arm64|arm64|arch:aarch64|aarch64)
-                if [[ "$sys_arch" != arm64 ]]; then
-                    printf '%s' "$sys_arch"
-                    return 0
-                fi
-                ;;
-            arch:!arm64|!arm64|arch:!aarch64|!aarch64)
-                if [[ "$sys_arch" == arm64 ]]; then
-                    printf '%s' "$sys_arch"
-                    return 0
-                fi
-                ;;
-            *)
-                printf '%s' "$c"
-                return 0
-                ;;
-        esac
-    done
-    printf 'unmet'
+    if [[ -z "$_UNMET_COND" && -n "$cond" ]]; then
+        _eval_cond "$cond"
+    fi
+    local r="${_UNMET_COND:-unmet}"
+    r="${r#!}"
+    r="${r#env:}"
+    r="${r#arch:}"
+    printf '%s' "${r:-unmet}"
 }
 
 # Prompt user for confirmation during interactive execution.
@@ -1649,8 +1520,7 @@ _preload_groups_conf() {
 
     local current_grp="" raw_line line
     while IFS= read -r raw_line || [[ -n "$raw_line" ]]; do
-        line="${raw_line#"${raw_line%%[![:space:]]*}"}"
-        line="${line%"${line##*[![:space:]]}"}"
+        line="$(_trim "$raw_line")"
         [[ -z "$line" || "$line" == '#'* ]] && continue
         if [[ "$line" =~ ^\[group:([a-zA-Z0-9_.-]+) ]]; then
             current_grp="${BASH_REMATCH[1]}"
@@ -1659,15 +1529,13 @@ _preload_groups_conf() {
         fi
         if [[ -n "$current_grp" && "$line" == *"="* ]]; then
             local k="${line%%=*}" v="${line#*=}"
-            k="${k#"${k%%[![:space:]]*}"}"; k="${k%"${k##*[![:space:]]}"}"
-            v="${v#"${v%%[![:space:]]*}"}"; v="${v%"${v##*[![:space:]]}"}"
-            if [[ "$k" == "description" ]]; then
-                _GROUP_DESCS["$current_grp"]="$v"
-            elif [[ "$k" == "packages" ]]; then
-                _GROUP_PACKAGES_MAP["$current_grp"]="$v"
-            elif [[ "$k" == "optional" ]]; then
-                _GROUP_OPTIONAL["$current_grp"]="$v"
-            fi
+            k="$(_trim "$k")"
+            v="$(_trim "$v")"
+            case "$k" in
+                description) _GROUP_DESCS["$current_grp"]="$v" ;;
+                packages)    _GROUP_PACKAGES_MAP["$current_grp"]="$v" ;;
+                optional)    _GROUP_OPTIONAL["$current_grp"]="$v" ;;
+            esac
         fi
     done < "$groups_conf"
 }
@@ -1693,9 +1561,7 @@ _get_group_packages() {
     local pkgs_str="$(_get_group_meta "$gname" "packages")"
     if [[ -n "$pkgs_str" ]]; then
         local p
-        IFS=',' read -ra p_arr <<< "$pkgs_str"
-        for p in "${p_arr[@]}"; do
-            p="${p#"${p%%[![:space:]]*}"}"; p="${p%"${p##*[![:space:]]}"}"
+        for p in ${pkgs_str//,/ }; do
             [[ -n "$p" ]] && printf '%s\n' "$p"
         done
     else
@@ -1732,42 +1598,25 @@ _collect_bashrc_snippets() {
     done < <(_get_groups)
 }
 
-
-
-# ---------------------------------------------------------------------------
-# Config-driven optional package resolution
-# ---------------------------------------------------------------------------
-_should_install_optional() {
-    local pkg="$1" desc="$2" is_rec="${3:-false}" is_alt="${4:-false}" alt_target="${5:-}"
-
-    # 1. Explicit package allow-list
-    local p
-    for p in "${OPTIONAL_PACKAGES[@]:-}"; do
-        [[ "$p" == "$pkg" ]] && return 0
-    done
-
-    # 2. Unanswered: check TTY for interactive prompt
-    if [[ -t 0 || -t 1 || -t 2 || -c /dev/tty ]] && [[ "$DRY_RUN" == false && "${NON_INTERACTIVE:-false}" == false ]]; then
-        local msg="Install optional package '${pkg}'?"
-        if [[ "$is_alt" == true ]]; then
-            msg="Install alternative package '${pkg}' ('${alt_target}' is installed)?"
-        fi
-        local PROMPT_INDENT="    "
-        _prompt_confirm "$msg" "$is_rec"
-        return $?
-    fi
-
-    # 3. Unanswered headless default: recommended packages install automatically
-    [[ "$is_rec" == true ]] && return 0 || return 1
-}
-
 _group_selected() {
     local gname="$1"
     if [[ ${#INSTALL_GROUPS[@]} -gt 0 ]]; then
-        local g
-        for g in "${INSTALL_GROUPS[@]}"; do
-            [[ "$g" == "$gname" ]] && return 0
-        done
+        [[ " ${INSTALL_GROUPS[*]} " == *" $gname "* ]] && return 0
+    fi
+
+    if [[ ${#OPTIONAL_PACKAGES[@]} -gt 0 ]]; then
+        local g_pkgs="$(_get_group_meta "$gname" "packages")"
+        if [[ -n "$g_pkgs" ]]; then
+            local op
+            for op in "${OPTIONAL_PACKAGES[@]}"; do
+                if _in_cond_list "$op" "$g_pkgs"; then
+                    return 0
+                fi
+            done
+        fi
+    fi
+
+    if [[ ${#INSTALL_GROUPS[@]} -gt 0 ]]; then
         return 1
     fi
 
@@ -1779,105 +1628,68 @@ _group_selected() {
 }
 
 _parse_section_header() {
-    local raw_header="$1"
+    local _psh_raw="$1"
     local -n _out_type="$2"
     local -n _out_ident="$3"
     local -n _out_mod="$4"
     local -n _out_valid="$5"
 
-    local l_type="" l_ident="" l_mod="append" l_valid=0
-
-    local header="${raw_header#"${raw_header%%[![:space:]]*}"}"
-    header="${header%"${header##*[![:space:]]}"}"
-    if [[ -z "$header" ]]; then
-        _out_type=""
-        _out_ident=""
-        _out_mod="append"
-        _out_valid=1
+    local _psh_hdr
+    _psh_hdr="$(_trim "$_psh_raw")"
+    if [[ -z "$_psh_hdr" ]]; then
+        _out_type="" _out_ident="" _out_mod="append" _out_valid=1
         return 0
     fi
 
-    local parts=()
-    IFS=':' read -ra parts <<< "$header"
-    local n=${#parts[@]}
-
-    if [[ $n -eq 0 ]]; then
-        _out_type=""
-        _out_ident=""
-        _out_mod="append"
-        _out_valid=1
-        return 0
-    fi
-
-    case "${parts[0]}" in
-        package|config|bashrc|template|group) l_type="${parts[0]}" ;;
-        *)
-            _out_type=""
-            _out_ident=""
-            _out_mod="append"
-            _out_valid=1
-            return 0
-            ;;
+    local _psh_stype="${_psh_hdr%%:*}"
+    case "$_psh_stype" in
+        package|config|bashrc|template|group) ;;
+        *) _out_type="" _out_ident="" _out_mod="append" _out_valid=1; return 0 ;;
     esac
 
-    if [[ "$l_type" == "template" ]]; then
-        if [[ $n -eq 1 ]]; then
-            l_ident=""
-            l_mod="append"
-        elif [[ $n -eq 2 ]]; then
-            l_ident="${parts[1]}"
-            l_mod="append"
-        else
-            l_ident="${parts[1]}"
-            l_mod="${parts[*]:2}"
-            l_valid=0
-        fi
-    else
-        if [[ $n -eq 1 ]]; then
-            l_ident=""
-            l_mod="append"
-        elif [[ $n -eq 2 ]]; then
-            local p1="${parts[1]}"
-            case "$p1" in
-                append|override|disable|once)
-                    l_ident=""
-                    l_mod="$p1"
-                    ;;
-                *)
-                    l_ident="$p1"
-                    l_mod="append"
-                    ;;
-            esac
-        elif [[ $n -eq 3 ]]; then
-            local p1="${parts[1]}"
-            local p2="${parts[2]}"
-            case "$p2" in
-                append|override|disable|once)
-                    l_ident="$p1"
-                    l_mod="$p2"
-                    ;;
-                *)
-                    l_ident="$p1"
-                    l_mod="$p2"
-                    l_valid=1
-                    ;;
-            esac
-        else
-            l_valid=1
-        fi
-        l_ident="${l_ident%.conf}"
-        l_ident="${l_ident#.}"
-        if [[ "$l_ident" == *config && "$l_ident" != "config" && "$l_ident" != */* && "$l_ident" != *"-"* ]]; then
-            l_ident="${l_ident%config}"
-        fi
+    local _psh_rest="${_psh_hdr#*:}"
+    if [[ "$_psh_rest" == "$_psh_hdr" ]]; then
+        _out_type="$_psh_stype" _out_ident="" _out_mod="append" _out_valid=0
+        return 0
     fi
 
-    _out_type="$l_type"
-    _out_ident="$l_ident"
-    _out_mod="$l_mod"
-    _out_valid="$l_valid"
-}
+    if [[ "$_psh_stype" == "template" ]]; then
+        local _psh_tident="${_psh_rest%%:*}"
+        local _psh_tflags="${_psh_rest#*:}"
+        [[ "$_psh_tflags" == "$_psh_rest" ]] && _psh_tflags="append"
+        _psh_tflags="${_psh_tflags//:/ }"
+        _out_type="template" _out_ident="$_psh_tident" _out_mod="$_psh_tflags" _out_valid=0
+        return 0
+    fi
 
+    local _psh_parts=()
+    IFS=':' read -ra _psh_parts <<< "$_psh_rest"
+    local _psh_n=${#_psh_parts[@]}
+    local _psh_ident="" _psh_mod="append" _psh_valid=0
+
+    if [[ $_psh_n -eq 1 ]]; then
+        case "${_psh_parts[0]}" in
+            append|override|disable|once) _psh_mod="${_psh_parts[0]}" ;;
+            *) _psh_ident="${_psh_parts[0]}" ;;
+        esac
+    elif [[ $_psh_n -eq 2 ]]; then
+        _psh_ident="${_psh_parts[0]}"
+        case "${_psh_parts[1]}" in
+            append|override|disable|once) _psh_mod="${_psh_parts[1]}" ;;
+            *) _psh_mod="${_psh_parts[1]}"; _psh_valid=1 ;;
+        esac
+    else
+        _psh_valid=1
+    fi
+
+    _psh_ident="${_psh_ident%.conf}"
+    _psh_ident="${_psh_ident#.}"
+    if [[ "$_psh_ident" == *config && "$_psh_ident" != "config" && "$_psh_ident" != */* && "$_psh_ident" != *"-"* ]]; then
+        _psh_ident="${_psh_ident%config}"
+    fi
+
+    _out_type="$_psh_stype" _out_ident="$_psh_ident" _out_mod="$_psh_mod" _out_valid="$_psh_valid"
+}
 
 _clear_pkg_keys() {
     local target="$1"
@@ -1897,12 +1709,29 @@ _parse_single_conf_file() {
     [[ ! -f "$file" ]] && return 0
 
     local cur_type="" cur_ident="" cur_mod="append"
-    local cur_tmpl_buf="" in_tmpl=false
+    local cur_tmpl_buf="" in_tmpl=false cur_last_key=""
     local raw_line line
 
+    _flush_tmpl() {
+        if [[ "$in_tmpl" == true ]]; then
+            local t_target="${cur_ident:-$default_pkg}"
+            local formatted_tmpl="$cur_tmpl_buf"
+            if [[ "$formatted_tmpl" != *"# target:"* && "$formatted_tmpl" != "#target:"* ]]; then
+                formatted_tmpl="# target: ${cur_ident:-$default_pkg} flags: ${cur_mod:-append}"$'\n'"$formatted_tmpl"
+            fi
+            if [[ "${_CONF_TMPL_DIS["$t_target"]:-0}" -ne 1 && "${_CONF_TMPL_DIS["$default_pkg"]:-0}" -ne 1 ]]; then
+                _CONF_TMPL_BUF["$t_target"]+="${formatted_tmpl}__TMPL_SEP__"
+                if [[ "$t_target" != "$default_pkg" && -n "$default_pkg" ]]; then
+                    _CONF_TMPL_BUF["$default_pkg"]+="${formatted_tmpl}__TMPL_SEP__"
+                fi
+            fi
+            cur_tmpl_buf=""
+            in_tmpl=false
+        fi
+    }
+
     while IFS= read -r raw_line || [[ -n "$raw_line" ]]; do
-        line="${raw_line#"${raw_line%%[![:space:]]*}"}"
-        line="${line%"${line##*[![:space:]]}"}"
+        line="$(_trim "$raw_line")"
 
         if [[ "$line" =~ ^\[(.*)\]$ ]]; then
             local header="${BASH_REMATCH[1]}"
@@ -1910,25 +1739,11 @@ _parse_single_conf_file() {
             _parse_section_header "$header" sec_type sec_ident sec_mod is_valid
 
             if [[ "$is_valid" -eq 0 ]]; then
-                if [[ "$in_tmpl" == true ]]; then
-                    local t_target="${cur_ident:-$default_pkg}"
-                    local formatted_tmpl="$cur_tmpl_buf"
-                    if [[ "$formatted_tmpl" != *"# target:"* && "$formatted_tmpl" != "#target:"* ]]; then
-                        formatted_tmpl="# target: ${cur_ident:-$default_pkg} flags: ${cur_mod:-append}"$'\n'"$formatted_tmpl"
-                    fi
-                    if [[ "${_CONF_TMPL_DIS["$t_target"]:-0}" -ne 1 && "${_CONF_TMPL_DIS["$default_pkg"]:-0}" -ne 1 ]]; then
-                        _CONF_TMPL_BUF["$t_target"]+="${formatted_tmpl}__TMPL_SEP__"
-                        if [[ "$t_target" != "$default_pkg" && -n "$default_pkg" ]]; then
-                            _CONF_TMPL_BUF["$default_pkg"]+="${formatted_tmpl}__TMPL_SEP__"
-                        fi
-                    fi
-                    cur_tmpl_buf=""
-                    in_tmpl=false
-                fi
-
+                _flush_tmpl
                 cur_type="$sec_type"
                 cur_ident="${sec_ident:-$default_pkg}"
                 cur_mod="$sec_mod"
+                cur_last_key=""
 
                 if [[ "$cur_type" == "template" ]]; then
                     in_tmpl=true
@@ -1982,65 +1797,35 @@ _parse_single_conf_file() {
             [[ -z "$line" || "$line" == '#'* ]] && continue
             if [[ "$line" == *"="* ]]; then
                 local key="${line%%=*}" val="${line#*=}"
-                key="${key#"${key%%[![:space:]]*}"}"; key="${key%"${key##*[![:space:]]}"}"
-                val="${val#"${val%%[![:space:]]*}"}"; val="${val%"${val##*[![:space:]]}"}"
+                key="$(_trim "${key,,}")"
+                val="$(_trim "$val")"
                 if [[ "$val" == "!delete" ]]; then
                     unset "_CONF_PKG_KEYS[${cur_ident}:${key}]"
+                    cur_last_key=""
                 else
                     _CONF_PKG_KEYS["${cur_ident}:${key}"]="$val"
+                    cur_last_key="$key"
+                fi
+            elif [[ -n "${cur_last_key:-}" ]]; then
+                local cont_val="$(_trim "$line")"
+                if [[ -n "$cont_val" ]]; then
+                    local existing="${_CONF_PKG_KEYS["${cur_ident}:${cur_last_key}"]:-}"
+                    if [[ "$existing" == *"," ]]; then
+                        _CONF_PKG_KEYS["${cur_ident}:${cur_last_key}"]="${existing} ${cont_val}"
+                    else
+                        _CONF_PKG_KEYS["${cur_ident}:${cur_last_key}"]="${existing}, ${cont_val}"
+                    fi
                 fi
             fi
         fi
     done < "$file"
 
-    if [[ "$in_tmpl" == true ]]; then
-        local t_target="${cur_ident:-$default_pkg}"
-        local formatted_tmpl="$cur_tmpl_buf"
-        if [[ "$formatted_tmpl" != *"# target:"* && "$formatted_tmpl" != "#target:"* ]]; then
-            formatted_tmpl="# target: ${cur_ident:-$default_pkg} flags: ${cur_mod:-append}"$'\n'"$formatted_tmpl"
-        fi
-        if [[ "${_CONF_TMPL_DIS["$t_target"]:-0}" -ne 1 && "${_CONF_TMPL_DIS["$default_pkg"]:-0}" -ne 1 ]]; then
-            _CONF_TMPL_BUF["$t_target"]+="${formatted_tmpl}__TMPL_SEP__"
-            if [[ "$t_target" != "$default_pkg" && -n "$default_pkg" ]]; then
-                _CONF_TMPL_BUF["$default_pkg"]+="${formatted_tmpl}__TMPL_SEP__"
-            fi
-        fi
-    fi
-}
-
-_get_pkg_prop() {
-    local pkg="$1" target_key="$2" default_val="$3"
-    shift 3
-    local key
-    for key in "$@"; do
-        if [[ -n "${_CONF_PKG_KEYS["${pkg}:${key}"]+x}" ]]; then
-            printf '%s' "${_CONF_PKG_KEYS["${pkg}:${key}"]}"
-            return 0
-        elif [[ -n "${_CONF_PKG_KEYS["${target_key}:${key}"]+x}" ]]; then
-            printf '%s' "${_CONF_PKG_KEYS["${target_key}:${key}"]}"
-            return 0
-        fi
-    done
-    printf '%s' "$default_val"
+    _flush_tmpl
 }
 
 _finalize_conf_caches() {
     local pdir="$1"
     [[ ! -d "$pdir" ]] && return 0
-
-    # Pre-index extra hook keys once across all packages instead of O(N*K) scan per package
-    declare -A _pkg_hooks=()
-    local k
-    if [[ ${#_CONF_PKG_KEYS[@]} -gt 0 ]]; then
-        for k in "${!_CONF_PKG_KEYS[@]}"; do
-            if [[ "$k" == *":cmd."* || "$k" == *":cmd" ]]; then
-                local prefix="${k%:*}"
-                local prop_name="${k#*:}"
-                local prop_val="${_CONF_PKG_KEYS["$k"]}"
-                _pkg_hooks["$prefix"]+="${prop_name}:\"${prop_val//\"/\\\"}\" "
-            fi
-        done
-    fi
 
     local conf_file
     for conf_file in "$pdir"/*/*.conf; do
@@ -2055,46 +1840,25 @@ _finalize_conf_caches() {
         local p_desc="${_CONF_PKG_KEYS["${pkg}:description"]:-${_CONF_PKG_KEYS["${target_key}:description"]:-${_CONF_PKG_KEYS["${pkg}:desc"]:-${_CONF_PKG_KEYS["${target_key}:desc"]:-}}}}"
         local p_scope="${_CONF_PKG_KEYS["${pkg}:system"]:-${_CONF_PKG_KEYS["${target_key}:system"]:-${_CONF_PKG_KEYS["${pkg}:scope"]:-${_CONF_PKG_KEYS["${target_key}:scope"]:-system}}}}"
 
-        local apt_pkg="${_CONF_PKG_KEYS["${pkg}:apt"]:-${_CONF_PKG_KEYS["${target_key}:apt"]:-}}"
-        local dnf_pkg="${_CONF_PKG_KEYS["${pkg}:dnf"]:-${_CONF_PKG_KEYS["${target_key}:dnf"]:-}}"
-        local pacman_pkg="${_CONF_PKG_KEYS["${pkg}:pacman"]:-${_CONF_PKG_KEYS["${target_key}:pacman"]:-}}"
-        local apk_pkg="${_CONF_PKG_KEYS["${pkg}:apk"]:-${_CONF_PKG_KEYS["${target_key}:apk"]:-}}"
-        local mise_spec="${_CONF_PKG_KEYS["${pkg}:mise"]:-${_CONF_PKG_KEYS["${target_key}:mise"]:-}}"
-        local uv_spec="${_CONF_PKG_KEYS["${pkg}:uv"]:-${_CONF_PKG_KEYS["${target_key}:uv"]:-}}"
-        local cargo_spec="${_CONF_PKG_KEYS["${pkg}:cargo"]:-${_CONF_PKG_KEYS["${target_key}:cargo"]:-}}"
-        local go_spec="${_CONF_PKG_KEYS["${pkg}:go"]:-${_CONF_PKG_KEYS["${target_key}:go"]:-}}"
-        local bun_spec="${_CONF_PKG_KEYS["${pkg}:bun"]:-${_CONF_PKG_KEYS["${target_key}:bun"]:-}}"
-        local npm_spec="${_CONF_PKG_KEYS["${pkg}:npm"]:-${_CONF_PKG_KEYS["${target_key}:npm"]:-}}"
-        local flatpak_spec="${_CONF_PKG_KEYS["${pkg}:flatpak"]:-${_CONF_PKG_KEYS["${target_key}:flatpak"]:-}}"
-        local brew_spec="${_CONF_PKG_KEYS["${pkg}:brew"]:-${_CONF_PKG_KEYS["${target_key}:brew"]:-}}"
-        local cmd_val="${_CONF_PKG_KEYS["${pkg}:cmd"]:-${_CONF_PKG_KEYS["${target_key}:cmd"]:-}}"
+        local inst_specs="" pm tool
+        for pm in apt dnf pacman apk; do
+            local val="${_CONF_PKG_KEYS["${pkg}:${pm}"]:-${_CONF_PKG_KEYS["${target_key}:${pm}"]:-}}"
+            [[ -n "$val" ]] && inst_specs+="${pm}:${val} "
+        done
+        for tool in mise uv cargo go bun npm flatpak brew cmd; do
+            local spec="${_CONF_PKG_KEYS["${pkg}:${tool}"]:-${_CONF_PKG_KEYS["${target_key}:${tool}"]:-}}"
+            [[ -n "$spec" ]] && inst_specs+="${tool}:\"${spec}\" "
+        done
+        local p_install="${_CONF_PKG_KEYS["${pkg}:install"]:-${_CONF_PKG_KEYS["${target_key}:install"]:-}}"
+        [[ -n "$p_install" ]] && inst_specs+="${p_install} "
+
         local cond_val="${_CONF_PKG_KEYS["${pkg}:cond"]:-${_CONF_PKG_KEYS["${target_key}:cond"]:-}}"
-        local rec_val="${_CONF_PKG_KEYS["${pkg}:recommended"]:-${_CONF_PKG_KEYS["${target_key}:recommended"]:-${_CONF_PKG_KEYS["${pkg}:rec"]:-${_CONF_PKG_KEYS["${target_key}:rec"]:-}}}}"
         local alt_val="${_CONF_PKG_KEYS["${pkg}:alt"]:-${_CONF_PKG_KEYS["${target_key}:alt"]:-}}"
         local needs_val="${_CONF_PKG_KEYS["${pkg}:needs"]:-${_CONF_PKG_KEYS["${target_key}:needs"]:-}}"
         local opt_val="${_CONF_PKG_KEYS["${pkg}:optional"]:-${_CONF_PKG_KEYS["${target_key}:optional"]:-}}"
+        local rec_val="${_CONF_PKG_KEYS["${pkg}:recommended"]:-${_CONF_PKG_KEYS["${target_key}:recommended"]:-${_CONF_PKG_KEYS["${pkg}:rec"]:-${_CONF_PKG_KEYS["${target_key}:rec"]:-}}}}"
         local dis_val="${_CONF_PKG_KEYS["${pkg}:disabled"]:-${_CONF_PKG_KEYS["${target_key}:disabled"]:-}}"
-        local p_install="${_CONF_PKG_KEYS["${pkg}:install"]:-${_CONF_PKG_KEYS["${target_key}:install"]:-}}"
         local p_opts="${_CONF_PKG_KEYS["${pkg}:options"]:-${_CONF_PKG_KEYS["${target_key}:options"]:-}}"
-
-        local extra_inst_specs="${_pkg_hooks["$target_key"]:-}${_pkg_hooks["$pkg"]:-}"
-
-        local inst_specs=""
-        [[ -n "$apt_pkg" ]] && inst_specs+="apt:${apt_pkg} "
-        [[ -n "$dnf_pkg" ]] && inst_specs+="dnf:${dnf_pkg} "
-        [[ -n "$pacman_pkg" ]] && inst_specs+="pacman:${pacman_pkg} "
-        [[ -n "$apk_pkg" ]] && inst_specs+="apk:${apk_pkg} "
-        [[ -n "$mise_spec" ]] && inst_specs+="mise:\"${mise_spec}\" "
-        [[ -n "$uv_spec" ]] && inst_specs+="uv:\"${uv_spec}\" "
-        [[ -n "$cargo_spec" ]] && inst_specs+="cargo:\"${cargo_spec}\" "
-        [[ -n "$go_spec" ]] && inst_specs+="go:\"${go_spec}\" "
-        [[ -n "$bun_spec" ]] && inst_specs+="bun:\"${bun_spec}\" "
-        [[ -n "$npm_spec" ]] && inst_specs+="npm:\"${npm_spec}\" "
-        [[ -n "$flatpak_spec" ]] && inst_specs+="flatpak:\"${flatpak_spec}\" "
-        [[ -n "$brew_spec" ]] && inst_specs+="brew:\"${brew_spec}\" "
-        [[ -n "$cmd_val" ]] && inst_specs+="cmd:\"${cmd_val}\" "
-        [[ -n "$extra_inst_specs" ]] && inst_specs+="${extra_inst_specs}"
-        [[ -n "$p_install" ]] && inst_specs+="${p_install} "
 
         local opt_specs=""
         [[ -n "$cond_val" ]] && opt_specs+="cond:${cond_val} "
@@ -2115,10 +1879,8 @@ _finalize_conf_caches() {
         _CONF_PKG_BIN["$conf_file"]="$p_bin"
         _CONF_PKG_DESC["$conf_file"]="$p_desc"
         _CONF_PKG_SCOPE["$conf_file"]="$p_scope"
-        inst_specs="${inst_specs#"${inst_specs%%[![:space:]]*}"}"; inst_specs="${inst_specs%"${inst_specs##*[![:space:]]}"}"
-        opt_specs="${opt_specs#"${opt_specs%%[![:space:]]*}"}"; opt_specs="${opt_specs%"${opt_specs##*[![:space:]]}"}"
-        _CONF_PKG_INSTALL["$conf_file"]="$inst_specs"
-        _CONF_PKG_OPTS["$conf_file"]="$opt_specs"
+        _CONF_PKG_INSTALL["$conf_file"]="$(_trim "$inst_specs")"
+        _CONF_PKG_OPTS["$conf_file"]="$(_trim "$opt_specs")"
 
         if [[ "${_CONF_BASHRC_DIS["$pkg"]:-${_CONF_BASHRC_DIS["$target_key"]:-0}}" -ne 1 ]]; then
             _CONF_BASHRC["$conf_file"]="${_CONF_BASHRC_BUF["$pkg"]:-${_CONF_BASHRC_BUF["$target_key"]:-}}"
@@ -2158,7 +1920,6 @@ _select_config_file() {
     elif [[ ${#available_configs[@]} -eq 1 ]]; then
         CONFIG_FILE="$sdir/${available_configs[0]}"
     else
-        # Multiple configurations found
         if [[ "${NON_INTERACTIVE:-false}" == false ]]; then
             local choice
             choice="$(_ui_select "Multiple configuration files found. Select environment:" "${available_configs[@]}")"
@@ -2200,8 +1961,7 @@ _preload_all_manifests() {
         for conf_file in "$pdir"/*/*.conf; do
             if [[ -f "$conf_file" ]]; then
                 local pkg_default
-                pkg_default="${conf_file#"$pdir/"}"
-                pkg_default="${pkg_default%.conf}"
+                pkg_default="$(_get_default_pkg_name "$conf_file")"
                 _parse_single_conf_file "$conf_file" "$pkg_default"
             fi
         done
@@ -2212,31 +1972,42 @@ _preload_all_manifests() {
         _parse_single_conf_file "$CONFIG_FILE" "global"
     fi
 
-    if [[ -n "${_CONF_PKG_KEYS["global:INSTALL_GROUPS"]:-}" ]]; then
-        local raw_ig="${_CONF_PKG_KEYS["global:INSTALL_GROUPS"]}"
-        raw_ig="${raw_ig//[()]/}"
-        raw_ig="${raw_ig//,/ }"
+    if [[ -n "${_CONF_PKG_KEYS["global:groups"]:-}" ]]; then
+        local raw_ig="${_CONF_PKG_KEYS["global:groups"]//[()]/}"
         INSTALL_GROUPS=()
-        local g
-        for g in $raw_ig; do
-            [[ -n "$g" ]] && INSTALL_GROUPS+=("$g")
+        read -ra INSTALL_GROUPS <<< "${raw_ig//,/ }"
+    fi
+
+    if [[ -n "${_CONF_PKG_KEYS["global:exclude"]:-}" ]]; then
+        local raw_ep="${_CONF_PKG_KEYS["global:exclude"]//[()]/}"
+        local ep
+        for ep in ${raw_ep//,/ }; do
+            [[ -n "$ep" ]] && _CONF_PKG_DISABLED["$ep"]=1
         done
+    fi
+
+    if [[ -n "${_CONF_PKG_KEYS["global:packages"]:-}" ]]; then
+        local raw_ip="${_CONF_PKG_KEYS["global:packages"]//[()]/}"
+        OPTIONAL_PACKAGES=()
+        read -ra OPTIONAL_PACKAGES <<< "${raw_ip//,/ }"
     fi
 
     _finalize_conf_caches "$pdir"
 }
 
+_get_default_pkg_name() {
+    local mfile="$1"
+    if [[ "$mfile" == "$PACKAGES_DIR"/*/*.conf ]]; then
+        local rel="${mfile#"$PACKAGES_DIR/"}"
+        printf '%s' "${rel%.conf}"
+    else
+        basename "$mfile" .conf
+    fi
+}
+
 _preload_manifest_file() {
     local mfile="$1"
-    local default_name="${2:-}"
-    if [[ -z "$default_name" ]]; then
-        if [[ "$mfile" == "$PACKAGES_DIR"/*/*.conf ]]; then
-            default_name="${mfile#"$PACKAGES_DIR/"}"
-            default_name="${default_name%.conf}"
-        else
-            default_name="$(basename "$mfile" .conf)"
-        fi
-    fi
+    local default_name="${2:-$(_get_default_pkg_name "$mfile")}"
 
     if [[ "$_CONF_CASCADE_DONE" -eq 0 ]]; then
         _preload_all_manifests "$PACKAGES_DIR"
@@ -2250,15 +2021,7 @@ _preload_manifest_file() {
 
 _parse_manifest_file() {
     local mfile="$1"
-    local default_name="${2:-}"
-    if [[ -z "$default_name" ]]; then
-        if [[ "$mfile" == "$PACKAGES_DIR"/*/*.conf ]]; then
-            default_name="${mfile#"$PACKAGES_DIR/"}"
-            default_name="${default_name%.conf}"
-        else
-            default_name="$(basename "$mfile" .conf)"
-        fi
-    fi
+    local default_name="${2:-$(_get_default_pkg_name "$mfile")}"
 
     _preload_manifest_file "$mfile" "$default_name"
 
@@ -2272,13 +2035,7 @@ _parse_manifest_file() {
 
 _package_is_active() {
     local mfile="$1"
-    local default_pkg
-    if [[ "$mfile" == "$PACKAGES_DIR"/*/*.conf ]]; then
-        default_pkg="${mfile#"$PACKAGES_DIR/"}"
-        default_pkg="${default_pkg%.conf}"
-    else
-        default_pkg="$(basename "$mfile" .conf)"
-    fi
+    local default_pkg="$(_get_default_pkg_name "$mfile")"
 
     _parse_manifest_file "$mfile" "$default_pkg"
     local rest="${pkg_install}${pkg_install:+ }${pkg_opts}"
@@ -2311,7 +2068,6 @@ _package_is_active() {
     return 0
 }
 
-
 _get_opt() {
     local key="$1" opts="$2"
     if [[ "$opts" =~ (^|[[:space:]])"$key":\"([^\"]+)\" ]]; then
@@ -2323,18 +2079,14 @@ _get_opt() {
     fi
 }
 
-
 _prompt_confirm() {
     local msg="$1" default_yes="${2:-false}"
     if [[ "${NON_INTERACTIVE:-false}" == true ]]; then
         [[ "$default_yes" == true ]] && return 0 || return 1
     fi
-    local answer="" prompt_hint="" ind="${PROMPT_INDENT:-  }"
-    if [[ "$default_yes" == true ]]; then
-        prompt_hint="${CLR_MUTED}[Y/n]${RESET}"
-    else
-        prompt_hint="${CLR_MUTED}[y/N]${RESET}"
-    fi
+    local answer="" ind="${PROMPT_INDENT:-  }"
+    local prompt_hint="${CLR_MUTED}[y/N]${RESET}"
+    [[ "$default_yes" == true ]] && prompt_hint="${CLR_MUTED}[Y/n]${RESET}"
     _ui_bell
     printf '%s%s %s %s: ' "$ind" "${CLR_PRIMARY}${SYM_Q}${RESET}" "${msg}" "$prompt_hint" >&2
     if [[ ! -t 0 ]]; then
@@ -2344,25 +2096,15 @@ _prompt_confirm() {
     else
         read -r answer 2>/dev/null || true
     fi
-    local res_code=0
+    local res_code=1
     if [[ "$default_yes" == true ]]; then
-        case "$answer" in
-            [nN]|[nN][oO]) res_code=1 ;;
-            *) res_code=0 ;;
-        esac
+        [[ "$answer" =~ ^[nN] ]] && res_code=1 || res_code=0
     else
-        case "$answer" in
-            [yY]|[yY][eE][sS]) res_code=0 ;;
-            *) res_code=1 ;;
-        esac
+        [[ "$answer" =~ ^[yY] ]] && res_code=0 || res_code=1
     fi
     if [[ -t 2 && -c /dev/tty ]]; then
-        local disp_ans
-        if [[ $res_code -eq 0 ]]; then
-            disp_ans="${CLR_SUCCESS}↳ yes${RESET}"
-        else
-            disp_ans="${CLR_MUTED}↳ no${RESET}"
-        fi
+        local disp_ans="${CLR_MUTED}${SYM_ARROW} no${RESET}"
+        [[ $res_code -eq 0 ]] && disp_ans="${CLR_SUCCESS}${SYM_ARROW} yes${RESET}"
         printf '\033[1A\033[2K%s%-24s %s\n' "$ind" "${msg}" "$disp_ans" >&2
     fi
     return $res_code
@@ -2431,97 +2173,52 @@ _wait_for_pm_lock() {
     local max_wait="${2:-30}"
     local waited=0
     [[ "$DRY_RUN" == true || -z "$pm" || "$pm" == "unknown" ]] && return 0
+
+    local lock_files=()
     case "$pm" in
         apt|apt-get)
-            local lock_files=(
+            lock_files=(
                 "/var/lib/dpkg/lock-frontend"
                 "/var/lib/dpkg/lock"
                 "/var/lib/apt/lists/lock"
                 "/var/cache/apt/archives/lock"
-            )
-            while [[ $waited -lt $max_wait ]]; do
-                local locked=false lf
-                for lf in "${lock_files[@]}"; do
-                    if _is_file_locked "$lf"; then
-                        locked=true
-                        break
-                    fi
-                done
-                if [[ "$locked" == false ]]; then
-                    return 0
-                fi
-                if [[ $waited -eq 0 ]]; then
-                    log_warn "Waiting for package manager lock to release (${pm})..."
-                fi
-                sleep 2
-                waited=$(( waited + 2 ))
-            done
-            log_warn "Package manager lock still held after ${max_wait}s. Proceeding anyway."
-            ;;
+            ) ;;
         pacman)
-            local db_lock="/var/lib/pacman/db.lck"
-            while [[ $waited -lt $max_wait && -f "$db_lock" ]]; do
-                if command -v pgrep >/dev/null 2>&1 && ! pgrep -x pacman >/dev/null 2>&1; then
-                    log_warn "Stale pacman lock file detected ($db_lock with no active pacman process). Proceeding."
-                    return 0
-                fi
-                if [[ $waited -eq 0 ]]; then
-                    log_warn "Waiting for pacman lock ($db_lock) to release..."
-                fi
-                sleep 2
-                waited=$(( waited + 2 ))
-            done
-            ;;
+            lock_files=("/var/lib/pacman/db.lck") ;;
         dnf)
-            local dnf_locks=("/var/run/dnf.pid" "/var/lib/dnf/lock")
-            while [[ $waited -lt $max_wait ]]; do
-                local d_locked=false dlf
-                for dlf in "${dnf_locks[@]}"; do
-                    if _is_file_locked "$dlf"; then
-                        d_locked=true; break
-                    fi
-                done
-                [[ "$d_locked" == false ]] && return 0
-                [[ $waited -eq 0 ]] && log_warn "Waiting for dnf lock to release..."
-                sleep 2
-                waited=$(( waited + 2 ))
-            done
-            ;;
+            lock_files=("/var/run/dnf.pid" "/var/lib/dnf/lock") ;;
         apk)
-            local apk_lock="/lib/apk/db/lock"
-            while [[ $waited -lt $max_wait && -f "$apk_lock" ]]; do
-                if _is_file_locked "$apk_lock"; then
-                    [[ $waited -eq 0 ]] && log_warn "Waiting for apk lock to release..."
-                    sleep 2
-                    waited=$(( waited + 2 ))
-                else
-                    break
-                fi
-            done
-            ;;
+            lock_files=("/lib/apk/db/lock") ;;
         zypper)
-            local zyp_lock="/var/run/zypp.pid"
-            while [[ $waited -lt $max_wait && -f "$zyp_lock" ]]; do
-                if _is_file_locked "$zyp_lock"; then
-                    [[ $waited -eq 0 ]] && log_warn "Waiting for zypper lock to release..."
-                    sleep 2
-                    waited=$(( waited + 2 ))
-                else
+            lock_files=("/var/run/zypp.pid") ;;
+        *) return 0 ;;
+    esac
+
+    while [[ $waited -lt $max_wait ]]; do
+        local locked=false lf
+        if [[ "$pm" == "pacman" && -f "/var/lib/pacman/db.lck" ]]; then
+            if command -v pgrep >/dev/null 2>&1 && ! pgrep -x pacman >/dev/null 2>&1; then
+                log_warn "Stale pacman lock file detected (/var/lib/pacman/db.lck with no active pacman process). Proceeding."
+                return 0
+            fi
+            locked=true
+        else
+            for lf in "${lock_files[@]}"; do
+                if _is_file_locked "$lf"; then
+                    locked=true
                     break
                 fi
             done
-            ;;
-    esac
-    return 0
-}
+        fi
 
-_run_pm() {
-    _wait_for_pm_lock "${_PM:-}"
-    if [[ "$VERBOSE" == true ]]; then
-        "$@"
-    else
-        _run_retry "$MAX_RETRIES" "$RETRY_DELAY" "Package manager" "$@"
-    fi
+        [[ "$locked" == false ]] && return 0
+        [[ $waited -eq 0 ]] && log_warn "Waiting for package manager lock to release (${pm})..."
+        sleep 2
+        waited=$(( waited + 2 ))
+    done
+
+    log_warn "Package manager lock still held after ${max_wait}s. Proceeding anyway."
+    return 0
 }
 
 # Wrapper: eval a script-method install command with retry and timeout.
@@ -2811,9 +2508,7 @@ _install_single_package() {
             if [[ "$DRY_RUN" == true ]]; then
                 log_success "$pkg_id (${provider})"
             else
-                local pkg_timeout="$(_get_pkg_prop "$pkg_id" "$target_key" "" "timeout")"
-                [[ -z "$pkg_timeout" ]] && pkg_timeout="$(_get_pkg_prop "$cpkg" "$target_key" "" "timeout")"
-                [[ -z "$pkg_timeout" ]] && pkg_timeout="$(_get_opt timeout "$rest")"
+                local pkg_timeout="${_CONF_PKG_KEYS["${pkg_id}:timeout"]:-${_CONF_PKG_KEYS["${target_key}:timeout"]:-${_CONF_PKG_KEYS["${cpkg}:timeout"]:-$(_get_opt timeout "$rest")}}}"
                 if SPINNER_INDENT="  " _run_script "$scmd" "${pkg_id} (${provider})" "${pkg_timeout:-$INSTALL_TIMEOUT}"; then
                     install_success=true
                 else
@@ -2822,23 +2517,18 @@ _install_single_package() {
             fi
         fi
 
+        local post_cmd="${_CONF_PKG_KEYS["${target_key}:${pm_key}.post"]:-${_CONF_PKG_KEYS["${pkg_id}:${pm_key}.post"]:-${_CONF_PKG_KEYS["${cpkg}:${pm_key}.post"]:-${_CONF_PKG_KEYS["${target_key}:post"]:-${_CONF_PKG_KEYS["${pkg_id}:post"]:-${_CONF_PKG_KEYS["${cpkg}:post"]:-}}}}}}"
+        [[ -z "$post_cmd" ]] && post_cmd="$(_get_opt "${pm_key}.post" "$rest")"
+        [[ -z "$post_cmd" ]] && post_cmd="$(_get_opt post "$rest")"
+
         local proceed_post=true
         if [[ "$install_success" == false ]]; then
             _FAILED_PACKAGES+=("$pkg_id")
             _FAILURE_REASONS["$pkg_id"]="${_LAST_CMD_ERROR:-Installation failed}"
             _CONF_PKG_DECLINED["$pkg_id"]=1
 
-            local has_post_actions=false
-            local post_cmd="${_CONF_PKG_KEYS["${target_key}:${pm_key}.post"]:-${_CONF_PKG_KEYS["${pkg_id}:${pm_key}.post"]:-${_CONF_PKG_KEYS["${cpkg}:${pm_key}.post"]:-${_CONF_PKG_KEYS["${target_key}:post"]:-${_CONF_PKG_KEYS["${pkg_id}:post"]:-${_CONF_PKG_KEYS["${cpkg}:post"]:-}}}}}}"
-            [[ -z "$post_cmd" ]] && post_cmd="$(_get_opt "${pm_key}.post" "$rest")"
-            [[ -z "$post_cmd" ]] && post_cmd="$(_get_opt post "$rest")"
-            local tmpl_check
-            tmpl_check="$(_extract_templates "$conf_file")"
+            local tmpl_check="${_CONF_TEMPLATES["$conf_file"]:-}"
             if [[ -n "$post_cmd" || -n "$tmpl_check" ]]; then
-                has_post_actions=true
-            fi
-
-            if [[ "$has_post_actions" == true ]]; then
                 if [[ "$DRY_RUN" == true ]]; then
                     proceed_post=true
                 elif [[ "${NON_INTERACTIVE:-false}" == true ]]; then
@@ -2860,9 +2550,6 @@ _install_single_package() {
 
         if [[ "$proceed_post" == true ]]; then
             # Run post hook if present (before verification so symlinks/wrappers exist)
-            local post_cmd="${_CONF_PKG_KEYS["${target_key}:${pm_key}.post"]:-${_CONF_PKG_KEYS["${pkg_id}:${pm_key}.post"]:-${_CONF_PKG_KEYS["${cpkg}:${pm_key}.post"]:-${_CONF_PKG_KEYS["${target_key}:post"]:-${_CONF_PKG_KEYS["${pkg_id}:post"]:-${_CONF_PKG_KEYS["${cpkg}:post"]:-}}}}}}"
-            [[ -z "$post_cmd" ]] && post_cmd="$(_get_opt "${pm_key}.post" "$rest")"
-            [[ -z "$post_cmd" ]] && post_cmd="$(_get_opt post "$rest")"
             if [[ -n "$post_cmd" ]]; then
                 if [[ "$DRY_RUN" == true ]]; then
                     [[ "$VERBOSE" == true ]] && log_action "    post: $post_cmd"
@@ -2924,14 +2611,9 @@ install_packages() {
         if [[ "$is_opt" == "false" || "$g" == "core" ]]; then
             grp_locks+=("required")
             grp_states+=(1)
-        elif [[ ${#INSTALL_GROUPS[@]} -gt 0 ]]; then
-            if _group_selected "$g"; then
-                grp_locks+=("optional")
-                grp_states+=(1)
-            else
-                grp_locks+=("optional")
-                grp_states+=(0)
-            fi
+        elif _group_selected "$g"; then
+            grp_locks+=("config")
+            grp_states+=(1)
         else
             grp_locks+=("optional")
             grp_states+=(0)
@@ -3015,7 +2697,10 @@ install_packages() {
                 IFS="$saved_ifs"
             fi
 
-            if [[ "$(_get_opt disabled "$rest")" == true || "${_CONF_PKG_DISABLED["$pkg"]:-0}" -eq 1 ]]; then
+            if [[ "${_CONF_PKG_DISABLED["$pkg"]:-0}" -eq 1 ]]; then
+                pkg_locks+=("disabled:config")
+                pkg_states+=(0)
+            elif [[ "$(_get_opt disabled "$rest")" == true ]]; then
                 pkg_locks+=("disabled")
                 pkg_states+=(0)
             elif ! _eval_cond "" "$rest"; then
@@ -3043,7 +2728,18 @@ install_packages() {
                 local is_opt="$(_get_opt optional "$rest")"
                 local is_rec="$(_get_opt recommended "$rest")"
 
-                if [[ "$is_opt" != true && -z "$alt_target" ]]; then
+                local is_opt_explicit=0
+                if [[ ${#OPTIONAL_PACKAGES[@]} -gt 0 ]]; then
+                    local op
+                    for op in "${OPTIONAL_PACKAGES[@]}"; do
+                        [[ "$op" == "$pkg" || "$op" == "$pkg_id" ]] && is_opt_explicit=1 && break
+                    done
+                fi
+
+                if [[ "$is_opt_explicit" -eq 1 ]]; then
+                    pkg_locks+=("config")
+                    pkg_states+=(1)
+                elif [[ "$is_opt" != true && -z "$alt_target" ]]; then
                     pkg_locks+=("required")
                     pkg_states+=(1)
                 elif [[ -n "$alt_target" ]]; then
@@ -3060,11 +2756,7 @@ install_packages() {
                 else
                     pkg_locks+=("optional")
                     if [[ ${#OPTIONAL_PACKAGES[@]} -gt 0 ]]; then
-                        local opt_match=0 op
-                        for op in "${OPTIONAL_PACKAGES[@]}"; do
-                            [[ "$op" == "$pkg" || "$op" == "$pkg_id" ]] && opt_match=1 && break
-                        done
-                        pkg_states+=($opt_match)
+                        pkg_states+=(0)
                     else
                         pkg_states+=(1)
                     fi
@@ -3113,6 +2805,14 @@ install_packages() {
 # ---------------------------------------------------------------------------
 # Atomic File Writer & Backup Manager
 # ---------------------------------------------------------------------------
+_backup_file() {
+    local dest="$1" rel="$2"
+    _get_backup_dir
+    mkdir -p "$BACKUP_DIR/$(dirname "$rel")"
+    mv "$dest" "$BACKUP_DIR/$rel"
+    BACKUP_COUNT=$((BACKUP_COUNT + 1))
+}
+
 _write_file() {
     local target="$1" content="$2" flags="${3:-}"
     local dest="${target/#\~/$HOME}"
@@ -3181,32 +2881,7 @@ _write_file() {
                 if [[ "$DRY_RUN" == true ]]; then
                     log_action "Would back up existing file: ${target}"
                 else
-                    _get_backup_dir
-                    mkdir -p "$BACKUP_DIR/$(dirname "$rel")"
-                    
-                    local file_sha="" file_mode=""
-                    if command -v sha256sum >/dev/null 2>&1; then
-                        read -r file_sha _ < <(sha256sum "$dest" 2>/dev/null || true)
-                    fi
-                    if command -v stat >/dev/null 2>&1; then
-                        file_mode="$(stat -c '%a' "$dest" 2>/dev/null || echo "644")"
-                    fi
-
-                    mv "$dest" "$BACKUP_DIR/$rel"
-                    BACKUP_COUNT=$((BACKUP_COUNT + 1))
-
-                    # Append to backup manifest
-                    local manifest_file="$BACKUP_DIR/.backup_manifest.json"
-                    local entry_json
-                    entry_json="{\"rel\":\"${rel}\",\"dest\":\"${dest}\",\"sha256\":\"${file_sha}\",\"mode\":\"${file_mode}\",\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}"
-                    if [[ ! -f "$manifest_file" ]]; then
-                        printf '[\n  %s\n]\n' "$entry_json" > "$manifest_file"
-                    else
-                        # Insert before the last line
-                        sed -i '$d' "$manifest_file" 2>/dev/null || true
-                        printf ',\n  %s\n]\n' "$entry_json" >> "$manifest_file"
-                    fi
-
+                    _backup_file "$dest" "$rel"
                     log_action "Backed up existing file: ${target}"
                 fi
             elif [[ -L "$dest" ]]; then
@@ -3290,15 +2965,6 @@ _rollback_latest_backup() {
     return 0
 }
 
-# ---------------------------------------------------------------------------
-# Template deployment
-# ---------------------------------------------------------------------------
-_extract_templates() {
-    local file="$1"
-    _preload_manifest_file "$file"
-    printf '%s' "${_CONF_TEMPLATES["$file"]:-}"
-}
-
 deploy_package_templates() {
     local conf_file="$1"
     [[ ! -f "$conf_file" ]] && return 0
@@ -3306,8 +2972,7 @@ deploy_package_templates() {
     local SPINNER_INDENT="${SPINNER_INDENT:-    }"
     _preload_manifest_file "$conf_file"
 
-    local tmpl_all
-    tmpl_all="$(_extract_templates "$conf_file")"
+    local tmpl_all="${_CONF_TEMPLATES["$conf_file"]:-}"
     [[ -z "$tmpl_all" ]] && return 0
 
     local rest="$tmpl_all"
@@ -3332,6 +2997,35 @@ deploy_package_templates() {
             content="$template_content"
         fi
 
+        if [[ -n "$tmpl_target" && "${_CONF_TMPL_DIS["$tmpl_target"]:-0}" -eq 1 ]]; then
+            continue
+        fi
+
+        # Check if user config has an explicit override for this template target
+        if [[ -n "$tmpl_target" && -n "${_CONF_TMPL_BUF["$tmpl_target"]:-}" ]]; then
+            local raw_custom="${_CONF_TMPL_BUF["$tmpl_target"]}"
+            while [[ -n "$raw_custom" ]]; do
+                local cur_cblock=""
+                if [[ "$raw_custom" == *"__TMPL_SEP__"* ]]; then
+                    cur_cblock="${raw_custom%%__TMPL_SEP__*}"
+                    raw_custom="${raw_custom#*__TMPL_SEP__}"
+                else
+                    cur_cblock="$raw_custom"
+                    raw_custom=""
+                fi
+                [[ -z "$cur_cblock" ]] && continue
+                local cur_cfirst="${cur_cblock%%$'\n'*}"
+                if [[ "$cur_cfirst" =~ flags:.*override ]]; then
+                    if [[ "$cur_cfirst" =~ ^#[[:space:]]*target:[[:space:]]*([^[:space:]]+)([[:space:]]+flags:(.+))? ]]; then
+                        tmpl_target="${BASH_REMATCH[1]}"
+                        [[ -n "${BASH_REMATCH[3]:-}" ]] && tmpl_flags="${BASH_REMATCH[3]}"
+                        content="${cur_cblock#*$'\n'}"
+                    fi
+                    break
+                fi
+            done
+        fi
+
         local tmpl_cond=""
         if [[ "$tmpl_flags" =~ cond=([^[:space:]]+) || "$tmpl_flags" =~ cond:([^[:space:]]+) ]]; then
             tmpl_cond="${BASH_REMATCH[1]}"
@@ -3346,6 +3040,7 @@ deploy_package_templates() {
         local pkg_name="${conf_file##*/}"; pkg_name="${pkg_name%.conf}"
         local var_name="TEMPLATE_OVERRIDE_${pkg_name^^}"
         var_name="${var_name//-/_}"
+        var_name="${var_name//./_}"
         local override_content="${!var_name:-}"
         [[ -n "$override_content" ]] && content="$override_content"
 
@@ -3372,26 +3067,61 @@ deploy_package_templates() {
     done
 }
 
-deploy_templates() {
-    local pdir="${1:-$PACKAGES_DIR}"
-    [[ ! -d "$pdir" ]] && return 0
-    _preload_all_manifests "$pdir"
+# ---------------------------------------------------------------------------
+# Deploy Standalone & Global Templates from User Config
+# ---------------------------------------------------------------------------
+deploy_global_templates() {
+    local global_tmpls="${_CONF_TMPL_BUF["global"]:-}"
+    [[ -z "$global_tmpls" ]] && return 0
+    local rest="$global_tmpls"
+    while [[ -n "$rest" ]]; do
+        local template_content=""
+        if [[ "$rest" == *"__TMPL_SEP__"* ]]; then
+            template_content="${rest%%__TMPL_SEP__*}"
+            rest="${rest#*__TMPL_SEP__}"
+        else
+            template_content="$rest"
+            rest=""
+        fi
+        [[ -z "$template_content" ]] && continue
 
-    local group pkg
-    while IFS= read -r group; do
-        [[ -z "$group" ]] && continue
-        _group_selected "$group" || continue
+        local first_line tmpl_target="" tmpl_flags="" content=""
+        first_line="${template_content%%$'\n'*}"
+        if [[ "$first_line" =~ ^#[[:space:]]*target:[[:space:]]*([^[:space:]]+)([[:space:]]+flags:(.+))? ]]; then
+            tmpl_target="${BASH_REMATCH[1]}"
+            [[ -n "${BASH_REMATCH[3]:-}" ]] && tmpl_flags="${BASH_REMATCH[3]}"
+            content="${template_content#*$'\n'}"
+        else
+            content="$template_content"
+        fi
 
-        while IFS= read -r pkg; do
-            [[ -z "$pkg" ]] && continue
-            local conf_file="$pdir/$group/$pkg.conf"
-            [[ ! -f "$conf_file" ]] && continue
+        case "$tmpl_target" in
+            .profile|~/.profile|.bash_profile|~/.bash_profile|.bashrc|~/.bashrc|.inputrc|~/.inputrc)
+                continue ;;
+        esac
 
-            if _package_is_active "$conf_file"; then
-                deploy_package_templates "$conf_file"
+        if [[ -n "$tmpl_target" && "${_CONF_TMPL_DIS["$tmpl_target"]:-0}" -eq 1 ]]; then
+            continue
+        fi
+
+        local tmpl_cond=""
+        if [[ "$tmpl_flags" =~ cond=([^[:space:]]+) || "$tmpl_flags" =~ cond:([^[:space:]]+) ]]; then
+            tmpl_cond="${BASH_REMATCH[1]}"
+        fi
+        if [[ -n "$tmpl_cond" ]]; then
+            if ! _eval_cond "$tmpl_cond"; then
+                log_info "Skipping template (unmet condition $tmpl_cond): $tmpl_target"
+                continue
             fi
-        done < <(_get_group_packages "$group")
-    done < <(_get_groups)
+        fi
+
+        if [[ -n "$tmpl_target" ]]; then
+            local write_flags="append"
+            [[ "$tmpl_flags" == *"once"* ]] && write_flags="once"
+            [[ "$tmpl_flags" == *"override"* ]] && write_flags="override"
+            _write_file "$tmpl_target" "$content" "$write_flags"
+        fi
+    done
 }
 
 _ensure_stow_ignore() {
@@ -3400,14 +3130,9 @@ _ensure_stow_ignore() {
     if [[ ! -f "$ignore_file" ]]; then
         mkdir -p "$DOTFILES_DIR"
         cat << 'EOF' > "$ignore_file"
-^packages\.conf$
-^myconfig.*$
-^config$
-^setup\.sh$
-^script\.sh$
+^\.git.*$
 ^README.*$
 ^LICENSE.*$
-^\.git.*$
 EOF
     fi
 }
@@ -3426,6 +3151,13 @@ deploy_stow() {
         [[ "$rel" == ".git"* || "$rel" == ".stow-local-ignore" ]] && continue
         dest="$HOME/$rel"
         if [[ -e "$dest" || -L "$dest" ]]; then
+            # Merge dynamically added tools (e.g. from mise use -g) before backup and symlinking
+            if [[ "$rel" == ".config/mise/config.toml" && -f "$dest" && ! -L "$dest" && -f "$file" ]]; then
+                if grep -q "^\[tools\]" "$dest" && ! grep -q "^\[tools\]" "$file"; then
+                    awk '/^\[tools\]/{flag=1} flag{print}' "$dest" >> "$file"
+                fi
+            fi
+
             real_dest="$(readlink -f "$dest" 2>/dev/null || true)"
             real_stow="$(readlink -f "$file" 2>/dev/null || true)"
             if [[ -n "$real_stow" && "$real_dest" != "$real_stow" ]]; then
@@ -3433,26 +3165,7 @@ deploy_stow() {
                     if [[ "$DRY_RUN" == true ]]; then
                         log_action "Would back up existing file before stow: ${rel}"
                     else
-                        _get_backup_dir
-                        mkdir -p "$BACKUP_DIR/$(dirname "$rel")"
-                        local file_sha="" file_mode=""
-                        if command -v sha256sum >/dev/null 2>&1; then
-                            read -r file_sha _ < <(sha256sum "$dest" 2>/dev/null || true)
-                        fi
-                        if command -v stat >/dev/null 2>&1; then
-                            file_mode="$(stat -c '%a' "$dest" 2>/dev/null || echo "644")"
-                        fi
-                        mv "$dest" "$BACKUP_DIR/$rel"
-                        BACKUP_COUNT=$((BACKUP_COUNT + 1))
-                        local manifest_file="$BACKUP_DIR/.backup_manifest.json"
-                        local entry_json
-                        entry_json="{\"rel\":\"${rel}\",\"dest\":\"${dest}\",\"sha256\":\"${file_sha}\",\"mode\":\"${file_mode}\",\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}"
-                        if [[ ! -f "$manifest_file" ]]; then
-                            printf '[\n  %s\n]\n' "$entry_json" > "$manifest_file"
-                        else
-                            sed -i '$d' "$manifest_file" 2>/dev/null || true
-                            printf ',\n  %s\n]\n' "$entry_json" >> "$manifest_file"
-                        fi
+                        _backup_file "$dest" "$rel"
                         log_action "Backed up existing file before stow: ${rel}"
                     fi
                 elif [[ -L "$dest" ]]; then
@@ -3471,7 +3184,7 @@ deploy_stow() {
         if [[ -f "$DOTFILES_DIR/.stow-local-ignore" ]]; then
             local p
             while IFS= read -r p || [[ -n "$p" ]]; do
-                p="${p#"${p%%[![:space:]]*}"}"; p="${p%"${p##*[![:space:]]}"}"
+                p="$(_trim "$p")"
                 [[ -z "$p" || "$p" == '#'* ]] && continue
                 ignore_patterns+=("$p")
             done < "$DOTFILES_DIR/.stow-local-ignore"
@@ -3533,35 +3246,28 @@ configure_git() {
         fi
     }
 
-    if [[ -n "$name" ]]; then
-        local cur_name
-        cur_name="$(git config --global user.name 2>/dev/null || true)"
-        if [[ "$name" != "$cur_name" ]]; then
-            _git_set user.name "$name"
-            if [[ "$DRY_RUN" != true ]]; then log_success "Set git user.name: ${name}"; fi
+    _git_set_if_changed() {
+        local key="$1" val="$2"
+        [[ -z "$val" ]] && return 0
+        local cur_val
+        cur_val="$(git config --global "$key" 2>/dev/null || true)"
+        if [[ "$val" != "$cur_val" ]]; then
+            _git_set "$key" "$val"
+            [[ "$DRY_RUN" != true ]] && log_success "Set git ${key}: ${val}"
         else
-            log_info "Git user.name already set: ${name}"
+            log_info "Git ${key} already set: ${val}"
         fi
-    fi
+    }
 
-    [[ -n "${GIT_DEFAULT_BRANCH:-}" ]] && _git_set init.defaultBranch "$GIT_DEFAULT_BRANCH"
-    [[ -n "${GIT_EDITOR:-}" ]] && _git_set core.editor "$GIT_EDITOR"
+    _git_set_if_changed "user.name" "$name"
+    _git_set_if_changed "user.email" "$email"
+    [[ -n "${GIT_DEFAULT_BRANCH:-}" ]] && _git_set "init.defaultBranch" "$GIT_DEFAULT_BRANCH"
+    [[ -n "${GIT_EDITOR:-}" ]] && _git_set "core.editor" "$GIT_EDITOR"
 
     if [[ -n "${GIT_SIGNING_KEY:-}" ]]; then
-        _git_set user.signingKey "$GIT_SIGNING_KEY"
-        _git_set commit.gpgSign true
-        if [[ "$DRY_RUN" != true ]]; then log_info "Git commit signing enabled: ${GIT_SIGNING_KEY}"; fi
-    fi
-
-    if [[ -n "$email" ]]; then
-        local cur_email
-        cur_email="$(git config --global user.email 2>/dev/null || true)"
-        if [[ "$email" != "$cur_email" ]]; then
-            _git_set user.email "$email"
-            if [[ "$DRY_RUN" != true ]]; then log_success "Set git user.email: ${email}"; fi
-        else
-            log_info "Git user.email already set: ${email}"
-        fi
+        _git_set "user.signingKey" "$GIT_SIGNING_KEY"
+        _git_set "commit.gpgSign" "true"
+        [[ "$DRY_RUN" != true ]] && log_info "Git commit signing enabled: ${GIT_SIGNING_KEY}"
     fi
 }
 
@@ -3735,6 +3441,7 @@ _lint_manifest() {
     [[ ! -d "$PACKAGES_DIR" ]] && { log_error "Packages directory not found."; exit 1; }
     _ui_header "Running Static Lint Checks"
     local errors=0
+    local NON_INTERACTIVE=true
 
     _preload_all_manifests "$PACKAGES_DIR"
 
@@ -3790,13 +3497,24 @@ _lint_manifest() {
         done
     done
 
-    local cfg
+    local -a cfg_list=()
     for cfg in "$SCRIPT_DIR/"*.conf; do
-        [[ ! -f "$cfg" ]] && continue
+        [[ -f "$cfg" ]] && cfg_list+=("$cfg")
+    done
+    if [[ -n "${CONFIG_FILE:-}" && -f "${CONFIG_FILE:-}" ]]; then
+        local already_in=false
+        for c in "${cfg_list[@]}"; do
+            [[ "$c" == "$CONFIG_FILE" ]] && already_in=true && break
+        done
+        [[ "$already_in" == false ]] && cfg_list+=("$CONFIG_FILE")
+    fi
+
+    local cfg
+    for cfg in "${cfg_list[@]}"; do
         local fname
         fname="$(basename "$cfg")"
 
-        local raw_line line
+        local raw_line line in_tmpl=false cur_sec=""
         while IFS= read -r raw_line || [[ -n "$raw_line" ]]; do
             line="${raw_line#"${raw_line%%[![:space:]]*}"}"
             line="${line%"${line##*[![:space:]]}"}"
@@ -3804,30 +3522,87 @@ _lint_manifest() {
                 local header="${BASH_REMATCH[1]}"
                 local sec_type="" sec_ident="" sec_mod="" is_valid=0
                 _parse_section_header "$header" sec_type sec_ident sec_mod is_valid
-                if [[ "$is_valid" -ne 0 ]]; then
+                if [[ "$is_valid" -eq 0 ]]; then
+                    cur_sec="$sec_type"
+                    if [[ "$sec_type" == "template" ]]; then
+                        in_tmpl=true
+                    else
+                        in_tmpl=false
+                    fi
+                elif [[ "$in_tmpl" == false ]]; then
                     log_error "Config $fname: Invalid section header or modifier syntax: '[$header]'"
                     errors=$((errors + 1))
                 fi
+            elif [[ "$cur_sec" == "config" && "$in_tmpl" == false && "$line" == *"="* ]]; then
+                local raw_k="${line%%=*}"
+                raw_k="${raw_k#"${raw_k%%[![:space:]]*}"}"; raw_k="${raw_k%"${raw_k##*[![:space:]]}"}"
+                local k_lower="${raw_k,,}"
+                case "$k_lower" in
+                    groups|packages|exclude|cond|disable_cond|git_user_name|git_email|git_default_branch)
+                        if [[ "$raw_k" != "$k_lower" ]]; then
+                            log_warn "Config $fname: '$raw_k' in [config] should be lowercase '$k_lower'."
+                        fi
+                        ;;
+                    install_groups)
+                        log_error "Config $fname: '$raw_k' is invalid in [config]. Use 'groups = ...' instead."
+                        errors=$((errors + 1))
+                        ;;
+                    install_packages)
+                        log_error "Config $fname: '$raw_k' is invalid in [config]. Use 'packages = ...' instead."
+                        errors=$((errors + 1))
+                        ;;
+                    exclude_packages)
+                        log_error "Config $fname: '$raw_k' is invalid in [config]. Use 'exclude = ...' instead."
+                        errors=$((errors + 1))
+                        ;;
+                    *)
+                        log_error "Config $fname: Unrecognized key '$raw_k' in [config]. Allowed: groups, packages, exclude, cond, disable_cond, git_user_name, git_email."
+                        errors=$((errors + 1))
+                        ;;
+                esac
             fi
         done < "$cfg"
     done
 
-    if [[ -n "${_CONF_PKG_KEYS["global:INSTALL_GROUPS"]:-}" ]]; then
-        local raw_ig="${_CONF_PKG_KEYS["global:INSTALL_GROUPS"]}"
-        raw_ig="${raw_ig//[()]/}"
-        raw_ig="${raw_ig//,/ }"
+    if [[ -n "${_CONF_PKG_KEYS["global:groups"]:-}" ]]; then
+        local raw_ig="${_CONF_PKG_KEYS["global:groups"]//[()]/}"
         local g
-        for g in $raw_ig; do
+        for g in ${raw_ig//,/ }; do
             [[ -z "$g" ]] && continue
-            local found=false vg
-            for vg in "${valid_groups[@]}"; do
-                if [[ "$g" == "$vg" ]]; then
-                    found=true
-                    break
-                fi
-            done
-            if [[ "$found" == false ]]; then
+            if [[ " ${valid_groups[*]} " != *" $g "* ]]; then
                 log_error "Configuration references unknown package group: '$g'"
+                errors=$((errors + 1))
+            fi
+        done
+    fi
+
+    # Validate packages list
+    local -a declared_pkgs=()
+    if [[ -n "${_CONF_PKG_KEYS["global:packages"]:-}" ]]; then
+        local raw_pkgs="${_CONF_PKG_KEYS["global:packages"]//[()]/}"
+        local p
+        for p in ${raw_pkgs//,/ }; do
+            [[ -z "$p" ]] && continue
+            declared_pkgs+=("$p")
+            if ! _find_pkg_manifest "$p" >/dev/null 2>&1; then
+                log_error "Configuration references unknown package in 'packages': '$p'"
+                errors=$((errors + 1))
+            fi
+        done
+    fi
+
+    # Validate exclude list and check conflicts
+    if [[ -n "${_CONF_PKG_KEYS["global:exclude"]:-}" ]]; then
+        local raw_ex="${_CONF_PKG_KEYS["global:exclude"]//[()]/}"
+        local ep
+        for ep in ${raw_ex//,/ }; do
+            [[ -z "$ep" ]] && continue
+            if ! _find_pkg_manifest "$ep" >/dev/null 2>&1; then
+                log_error "Configuration references unknown package in 'exclude': '$ep'"
+                errors=$((errors + 1))
+            fi
+            if [[ " ${declared_pkgs[*]:-} " == *" $ep "* ]]; then
+                log_error "Configuration conflict: Package '$ep' is listed in both 'packages' and 'exclude'."
                 errors=$((errors + 1))
             fi
         done
@@ -3949,11 +3724,9 @@ _doctor_check() {
 
     # 5. Broken Symlink Check
     printf "\n  %s[5/6]%s %s\n" "${CLR_MUTED}" "${RESET}" "${BOLD}Symlink Integrity${RESET}"
-    local broken_links=()
+    local broken_links=() link
     while IFS= read -r -d '' link; do
-        if [[ ! -e "$link" ]]; then
-            broken_links+=("$link")
-        fi
+        [[ ! -e "$link" ]] && broken_links+=("$link")
     done < <(find "$HOME" "$HOME/.config" -maxdepth 1 -type l -print0 2>/dev/null)
 
     if [[ ${#broken_links[@]} -eq 0 ]]; then
@@ -3967,7 +3740,7 @@ _doctor_check() {
         else
             log_warn "Found ${#broken_links[@]} broken symlink(s):"
             for link in "${broken_links[@]}"; do
-                printf "    %s %s\n" "${CLR_MUTED}•${RESET}" "$link"
+                printf "    %s %s\n" "${CLR_MUTED}${SYM_BULLET}${RESET}" "$link"
             done
             log_info "Run './rigrc.sh --doctor --fix' or './rigrc.sh --clean-symlinks' to remove them."
             warnings=$((warnings + 1))
@@ -4048,6 +3821,7 @@ _export_diagnostics() {
     cat << EOF > "$outfile"
 {
   "timestamp": "$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date)",
+  "rigrc_version": "${RIGRC_VERSION}",
   "distro": "${distro}",
   "arch": "${arch}",
   "package_manager": "${pm}",
@@ -4078,60 +3852,93 @@ EOF
 # ---------------------------------------------------------------------------
 # Help & Manifest Querying
 # ---------------------------------------------------------------------------
+_show_version() {
+    printf 'rigrc %s\n' "$RIGRC_VERSION"
+    exit 0
+}
+
 _show_help() {
-    printf '%s\n' "${CLR_PRIMARY}${BOLD}Dotfiles Setup${RESET}"
-    printf '\n%s\n' "${BOLD}USAGE${RESET}"
-    printf '    ./rigrc.sh %s[OPTIONS]%s\n' "${CLR_ACCENT}" "${RESET}"
-    printf '\n%s\n' "${BOLD}OPTIONS${RESET}"
-    printf '    %s %-30s %s\n' \
-        "${CLR_PRIMARY}•${RESET}" '-c, --config <file>'        'Load configuration file' \
-        "${CLR_PRIMARY}•${RESET}" '-y, --non-interactive'      'Run in automated non-interactive mode' \
-        "${CLR_PRIMARY}•${RESET}" '-v, --verbose'               'Show verbose command output' \
-        "${CLR_PRIMARY}•${RESET}" '-f, --force, --reset'        'Overwrite existing files and bypass locks' \
-        "${CLR_PRIMARY}•${RESET}" '    --env <environment>'     'Override detected environment (wsl, vps, desktop)' \
-        "${CLR_PRIMARY}•${RESET}" '    --skip-upgrade'          'Skip system package manager update and upgrade' \
-        "${CLR_PRIMARY}•${RESET}" '    --offline'               'Skip network checks and online package downloads' \
-        "${CLR_PRIMARY}•${RESET}" '    --verify-scripts'        'Prompt before running installation scripts' \
-        "${CLR_PRIMARY}•${RESET}" '    --list'                  'List available packages by group' \
-        "${CLR_PRIMARY}•${RESET}" '    --fmt, --format'         'Format configuration and manifest files' \
-        "${CLR_PRIMARY}•${RESET}" '    --lint'                  'Validate manifest and configuration syntax' \
-        "${CLR_PRIMARY}•${RESET}" '    --clean-symlinks'        'Remove broken dotfile symlinks in home directory' \
-        "${CLR_PRIMARY}•${RESET}" '    --rollback [snapshot]'   'Roll back snapshot from ~/.dotfiles.bak' \
-        "${CLR_PRIMARY}•${RESET}" '    --export-diagnostics'    'Export diagnostic snapshot to JSON file' \
-        "${CLR_PRIMARY}•${RESET}" '    --doctor [--fix]'        'Check system environment and repair missing paths' \
-        "${CLR_PRIMARY}•${RESET}" '-h, --help'                  'Show help'
-    printf '\n%s\n' "${BOLD}EXAMPLES${RESET}"
-    printf '    %s %s\n' \
-        "${CLR_MUTED}\$${RESET}" './rigrc.sh' \
-        "${CLR_MUTED}\$${RESET}" './rigrc.sh --config work.conf' \
-        "${CLR_MUTED}\$${RESET}" './rigrc.sh --rollback' \
-        "${CLR_MUTED}\$${RESET}" './rigrc.sh --doctor --fix' \
-        "${CLR_MUTED}\$${RESET}" './rigrc.sh --export-diagnostics' \
-        "${CLR_MUTED}\$${RESET}" './rigrc.sh --fmt' \
-        "${CLR_MUTED}\$${RESET}" './rigrc.sh --lint' \
-        "${CLR_MUTED}\$${RESET}" './rigrc.sh --clean-symlinks'
-    printf '\n%s\n' "${BOLD}FILES${RESET}"
-    printf '    %-24s %s\n' \
-        'packages/'               'Package definitions and configuration templates' \
-        'packages/_groups.conf'   'Package group definitions' \
-        'src/base.conf'           'Base settings and shell templates'
+    cat << EOF
+${CLR_PRIMARY}${BOLD}Dotfiles Setup${RESET}
+
+${BOLD}USAGE${RESET}
+    ./rigrc.sh ${CLR_ACCENT}[OPTIONS]${RESET}
+
+${BOLD}OPTIONS${RESET}
+    ${CLR_PRIMARY}${SYM_BULLET}${RESET} -c, --config <file>            Load configuration file
+    ${CLR_PRIMARY}${SYM_BULLET}${RESET} -y, --non-interactive          Run in automated non-interactive mode
+    ${CLR_PRIMARY}${SYM_BULLET}${RESET} -v, --verbose                   Show verbose command output
+    ${CLR_PRIMARY}${SYM_BULLET}${RESET} -f, --force, --reset            Overwrite existing files and bypass locks
+    ${CLR_PRIMARY}${SYM_BULLET}${RESET}     --env <environment>         Override detected environment (wsl, vps, desktop)
+    ${CLR_PRIMARY}${SYM_BULLET}${RESET}     --skip-upgrade              Skip system package manager update and upgrade
+    ${CLR_PRIMARY}${SYM_BULLET}${RESET}     --offline                   Skip network checks and online package downloads
+    ${CLR_PRIMARY}${SYM_BULLET}${RESET}     --verify-scripts            Prompt before running installation scripts
+    ${CLR_PRIMARY}${SYM_BULLET}${RESET}     --list                      List available packages by group
+    ${CLR_PRIMARY}${SYM_BULLET}${RESET}     --fmt, --format             Format configuration and manifest files
+    ${CLR_PRIMARY}${SYM_BULLET}${RESET}     --lint                      Validate manifest and configuration syntax
+    ${CLR_PRIMARY}${SYM_BULLET}${RESET}     --clean-symlinks            Remove broken dotfile symlinks in home directory
+    ${CLR_PRIMARY}${SYM_BULLET}${RESET}     --rollback [snapshot]       Roll back snapshot from ~/.dotfiles.bak
+    ${CLR_PRIMARY}${SYM_BULLET}${RESET}     --export-diagnostics        Export diagnostic snapshot to JSON file
+    ${CLR_PRIMARY}${SYM_BULLET}${RESET}     --doctor [--fix]            Check system environment and repair missing paths
+    ${CLR_PRIMARY}${SYM_BULLET}${RESET} -V, --version                   Show version
+    ${CLR_PRIMARY}${SYM_BULLET}${RESET} -h, --help                      Show help
+
+${BOLD}EXAMPLES${RESET}
+    ${CLR_MUTED}\$${RESET} ./rigrc.sh
+    ${CLR_MUTED}\$${RESET} ./rigrc.sh --config work.conf
+    ${CLR_MUTED}\$${RESET} ./rigrc.sh --rollback
+    ${CLR_MUTED}\$${RESET} ./rigrc.sh --doctor --fix
+    ${CLR_MUTED}\$${RESET} ./rigrc.sh --export-diagnostics
+    ${CLR_MUTED}\$${RESET} ./rigrc.sh --fmt
+    ${CLR_MUTED}\$${RESET} ./rigrc.sh --lint
+    ${CLR_MUTED}\$${RESET} ./rigrc.sh --clean-symlinks
+
+${BOLD}FILES${RESET}
+    packages/                Package definitions and configuration templates
+    packages/_groups.conf    Package group definitions
+    src/base.conf            Base settings and shell templates
+EOF
     exit 0
 }
 
 _list_all() {
     [[ ! -d "$PACKAGES_DIR" ]] && { log_error "Packages directory not found."; exit 1; }
+    _preload_all_manifests "$PACKAGES_DIR"
     printf '\n%s %s\n\n' "${CLR_PRIMARY}${SYM_DOT}${RESET}" "${BOLD}Available Packages by Group${RESET}"
     local gname pkg
     while IFS= read -r gname; do
         [[ -z "$gname" ]] && continue
         local gdesc="$(_get_group_meta "$gname" "description")"
-        if [[ -n "$gdesc" ]]; then
-            printf '  %s %s\n' "${CLR_ACCENT}${BOLD}[${gname}]${RESET}" "${CLR_MUTED}- ${gdesc}${RESET}"
-        else
-            printf '  %s\n' "${CLR_ACCENT}${BOLD}[${gname}]${RESET}"
+        local grp_active=true
+        if ! _group_selected "$gname"; then
+            grp_active=false
         fi
+
+        if [[ "$grp_active" == true ]]; then
+            if [[ -n "$gdesc" ]]; then
+                printf '  %s %s\n' "${CLR_ACCENT}${BOLD}[${gname}]${RESET}" "${CLR_MUTED}- ${gdesc}${RESET}"
+            else
+                printf '  %s\n' "${CLR_ACCENT}${BOLD}[${gname}]${RESET}"
+            fi
+        else
+            if [[ -n "$gdesc" ]]; then
+                printf '  %s %s %s\n' "${CLR_MUTED}[${gname}]${RESET}" "${CLR_MUTED}- ${gdesc}${RESET}" "${CLR_MUTED}(group disabled)${RESET}"
+            else
+                printf '  %s %s\n' "${CLR_MUTED}[${gname}]${RESET}" "${CLR_MUTED}(group disabled)${RESET}"
+            fi
+        fi
+
         while IFS= read -r pkg; do
-            [[ -n "$pkg" ]] && printf '    %s %s\n' "${CLR_MUTED}•${RESET}" "$pkg"
+            [[ -z "$pkg" ]] && continue
+            local is_dis=0
+            if [[ "${_CONF_PKG_DISABLED["$pkg"]:-0}" -eq 1 || "$grp_active" == false ]]; then
+                is_dis=1
+            fi
+            if [[ "$is_dis" -eq 1 ]]; then
+                printf '    %s %s %s\n' "${CLR_MUTED}${SYM_DASH}${RESET}" "${CLR_MUTED}${pkg}${RESET}" "${CLR_MUTED}(excluded)${RESET}"
+            else
+                printf '    %s %s\n' "${CLR_PRIMARY}${SYM_BULLET}${RESET}" "${BOLD}${pkg}${RESET}"
+            fi
         done < <(_get_group_packages "$gname")
     done < <(_get_groups)
     exit 0
@@ -4174,6 +3981,7 @@ _parse_args() {
                     _doctor_check
                 fi
                 ;;
+            -V|--version)                         _show_version ;;
             -h|--help) _show_help ;;
             --) shift; break ;;
             -*) log_error "Unknown option '$1'. Run './rigrc.sh --help' for usage."; exit 1 ;;
@@ -4196,13 +4004,13 @@ _main() {
     local conds; conds="$(_get_detected_conds)"
 
     if [[ -t 2 && -z "${NO_COLOR:-}" ]]; then
-        printf '\n%s %s\n' "${CLR_PRIMARY}${BOLD}Dotfiles Setup${RESET}" "${CLR_MUTED}v2.0${RESET}" >&2
+        printf '\n%s %s\n' "${CLR_PRIMARY}${BOLD}Dotfiles Setup${RESET}" "${CLR_MUTED}(${RIGRC_VERSION})${RESET}" >&2
     else
-        printf '\nDotfiles Setup v2.0\n' >&2
+        printf '\nDotfiles Setup (%s)\n' "${RIGRC_VERSION}" >&2
     fi
 
     # ── Phase 1: Preflight ──
-    _ui_phase 1 6 "Preflight"
+    _ui_phase "Preflight"
     _check_disk_space 500 "$HOME" || exit 1
 
     local net_status="online"
@@ -4213,7 +4021,7 @@ _main() {
     [[ "$net_status" == "offline/limited" ]] && log_warn "Network appears offline or limited. Online downloads may fail."
 
     # ── Phase 2: Configuration ──
-    _ui_phase 2 6 "Configuration"
+    _ui_phase "Configuration"
     _preload_all_manifests "$PACKAGES_DIR"
 
     local cfg_name="base (built-in)"
@@ -4221,12 +4029,12 @@ _main() {
     printf '  Loaded configuration: %s\n' "${BOLD}${cfg_name}${RESET}"
 
     # ── Phase 3: Identity ──
-    _ui_phase 3 6 "Identity"
+    _ui_phase "Identity"
     _PM="$(_detect_pm)"
     _acquire_sudo "$_PM"
 
-    GIT_USER_NAME="${_CONF_PKG_KEYS["core/git:GIT_USER_NAME"]:-${_CONF_PKG_KEYS["git:GIT_USER_NAME"]:-${_CONF_PKG_KEYS["global:GIT_USER_NAME"]:-${GIT_USER_NAME:-}}}}"
-    GIT_EMAIL="${_CONF_PKG_KEYS["core/git:GIT_EMAIL"]:-${_CONF_PKG_KEYS["git:GIT_EMAIL"]:-${_CONF_PKG_KEYS["global:GIT_EMAIL"]:-${GIT_EMAIL:-}}}}"
+    GIT_USER_NAME="${_CONF_PKG_KEYS["core/git:git_user_name"]:-${_CONF_PKG_KEYS["git:git_user_name"]:-${_CONF_PKG_KEYS["global:git_user_name"]:-${_CONF_PKG_KEYS["core/git:GIT_USER_NAME"]:-${_CONF_PKG_KEYS["git:GIT_USER_NAME"]:-${_CONF_PKG_KEYS["global:GIT_USER_NAME"]:-${GIT_USER_NAME:-}}}}}}}"
+    GIT_EMAIL="${_CONF_PKG_KEYS["core/git:git_email"]:-${_CONF_PKG_KEYS["git:git_email"]:-${_CONF_PKG_KEYS["global:git_email"]:-${_CONF_PKG_KEYS["core/git:GIT_EMAIL"]:-${_CONF_PKG_KEYS["git:GIT_EMAIL"]:-${_CONF_PKG_KEYS["global:GIT_EMAIL"]:-${GIT_EMAIL:-}}}}}}}"
 
     local FINAL_NAME=""
     local CUR_NAME
@@ -4270,11 +4078,11 @@ _main() {
     fi
 
     # ── Phase 4: System Packages ──
-    _ui_phase 4 6 "System Packages"
+    _ui_phase "System Packages"
     _upgrade_system
 
     # ── Phase 5: Packages ──
-    _ui_phase 5 6 "Packages"
+    _ui_phase "Packages"
     if [[ -d "$PACKAGES_DIR" ]]; then
         install_packages "$PACKAGES_DIR"
     else
@@ -4282,22 +4090,24 @@ _main() {
     fi
 
     # ── Phase 6: Dotfiles ──
-    _ui_phase 6 6 "Dotfiles"
+    _ui_phase "Dotfiles"
 
-    local _prof_tmpl="${_CONF_TMPL_BUF[".profile"]:-${_CONF_TMPL_BUF["profile"]:-}}"
-    local _bprof_tmpl="${_CONF_TMPL_BUF[".bash_profile"]:-${_CONF_TMPL_BUF["bash_profile"]:-}}"
-    local _bashrc_tmpl="${_CONF_TMPL_BUF[".bashrc"]:-${_CONF_TMPL_BUF["bashrc"]:-}}"
-    local _inputrc_tmpl="${_CONF_TMPL_BUF[".inputrc"]:-${_CONF_TMPL_BUF["inputrc"]:-}}"
+    local target_key key fname env_var tmpl_raw override_val
+    for target_key in "profile:.profile:TEMPLATE_OVERRIDE_PROFILE" \
+                      "bash_profile:.bash_profile:TEMPLATE_OVERRIDE_BASH_PROFILE" \
+                      "bashrc:.bashrc:TEMPLATE_OVERRIDE_BASHRC" \
+                      "inputrc:.inputrc:TEMPLATE_OVERRIDE_INPUTRC"; do
+        IFS=':' read -r key fname env_var <<< "$target_key"
+        tmpl_raw="${_CONF_TMPL_BUF[".$key"]:-${_CONF_TMPL_BUF["$key"]:-}}"
+        tmpl_raw="${tmpl_raw%__TMPL_SEP__}"
+        override_val="${!env_var:-$tmpl_raw}"
 
-    _prof_tmpl="${_prof_tmpl%__TMPL_SEP__}"
-    _bprof_tmpl="${_bprof_tmpl%__TMPL_SEP__}"
-    _bashrc_tmpl="${_bashrc_tmpl%__TMPL_SEP__}"
-    _inputrc_tmpl="${_inputrc_tmpl%__TMPL_SEP__}"
-
-    _write_file "~/.profile" "${TEMPLATE_OVERRIDE_PROFILE:-$_prof_tmpl}" "once"
-    _write_file "~/.bash_profile" "${TEMPLATE_OVERRIDE_BASH_PROFILE:-$_bprof_tmpl}" "once"
-    [[ -n "$_bashrc_tmpl" ]] && _write_file "~/.bashrc" "${TEMPLATE_OVERRIDE_BASHRC:-$_bashrc_tmpl}" "once"
-    [[ -n "$_inputrc_tmpl" ]] && _write_file "~/.inputrc" "${TEMPLATE_OVERRIDE_INPUTRC:-$_inputrc_tmpl}" "once"
+        if [[ "$key" == "bashrc" || "$key" == "inputrc" ]]; then
+            [[ -n "$override_val" ]] && _write_file "~/$fname" "$override_val" "once"
+        else
+            _write_file "~/$fname" "$override_val" "once"
+        fi
+    done
 
     # Deploy and integrate shell configuration
     if [[ -d "$PACKAGES_DIR" ]]; then
@@ -4337,8 +4147,20 @@ _main() {
         fi
     fi
 
+    # Deploy standalone and user config global templates
+    deploy_global_templates
+
     # Stow all generated dotfiles from dotfiles repository into $HOME.
     deploy_stow
+
+    # Re-generate mise shims for dynamically installed tools
+    if [[ "$DRY_RUN" != true ]]; then
+        if command -v mise >/dev/null 2>&1; then
+            mise reshim 2>/dev/null || true
+        elif [[ -x "$HOME/.local/bin/mise" ]]; then
+            "$HOME/.local/bin/mise" reshim 2>/dev/null || true
+        fi
+    fi
 
     # Git personal settings: applied AFTER stow so global options write to stowed gitconfig.
     configure_git "${FINAL_NAME:-${GIT_USER_NAME:-}}" "${FINAL_EMAIL:-${GIT_EMAIL:-}}"
@@ -4370,413 +4192,412 @@ fi
 return 0 2>/dev/null || exit 0
 
 __PAYLOAD_BEGIN__
-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
-6gBYAgA=
+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
+Bx100EEHHXTQQQefCf4DcDEZ5gBYAgA=

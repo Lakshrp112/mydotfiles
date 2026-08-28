@@ -1,0 +1,27 @@
+name: Sync Upstream
+
+on:
+  workflow_dispatch:      # Manual trigger
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download latest release bundle
+        run: |
+          curl -fsSL https://github.com/roypriyanshu02/rigrc/releases/latest/download/rigrc.sh -o rigrc.sh
+          chmod +x rigrc.sh
+
+      - name: Validate configuration files against new bundle
+        run: |
+          ./rigrc.sh --lint
+
+      - name: Commit and push changes
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore(upstream): update rigrc.sh release bundle"
+          file_pattern: "rigrc.sh"
