@@ -5,7 +5,7 @@ Personal dotfiles managed with [rigrc](https://github.com/roypriyanshu02/rigrc).
 ## Profiles
 
 - `dev.conf` — Workstation and WSL setup
-- `vps.conf` — Headless server setup
+- `dev-server.conf` — Headless server setup
 
 ## Quick Start
 
@@ -17,7 +17,7 @@ cd ~/.dotfiles-repo
 ./rigrc.sh --config=dev.conf
 
 # Server (headless)
-./rigrc.sh --config=vps.conf --non-interactive
+./rigrc.sh --config=dev-server.conf --non-interactive
 ```
 
 ## Maintenance
