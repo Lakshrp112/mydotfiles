@@ -1,0 +1,11 @@
+[wsl2]
+networkingMode=mirrored
+memory=13GB
+processors=6
+autoProxy=true
+
+[experimental]
+sparseVhd=true
+dnsTunneling=true
+autoMemoryReclaim=gradual
+hostAddressLoopback=true
