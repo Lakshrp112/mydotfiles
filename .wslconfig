@@ -1,5 +1,6 @@
 [wsl2]
 networkingMode=mirrored
+firewall=true
 memory=13GB
 processors=6
 autoProxy=true
