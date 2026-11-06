@@ -9,6 +9,23 @@ Personal dotfiles managed with [rigrc](https://github.com/roypriyanshu02/rigrc).
 
 ## Quick Start
 
+### 1. WSL Prerequisites (Windows only)
+
+If running in WSL2, copy `.wslconfig` to your Windows user directory to enable mirrored networking:
+
+```powershell
+# Run in PowerShell on Windows:
+Copy-Item .wslconfig "$env:USERPROFILE\.wslconfig" -Force
+wsl --shutdown
+```
+
+Or from inside your WSL terminal:
+```bash
+cp .wslconfig "$(wslpath "$USERPROFILE")/.wslconfig"
+```
+
+### 2. Run Setup
+
 ```bash
 git clone https://github.com/Lakshrp112/mydotfiles.git ~/.dotfiles-repo
 cd ~/.dotfiles-repo
